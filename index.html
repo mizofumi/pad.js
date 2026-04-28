@@ -163,7 +163,102 @@ if (servedir) {
 }
 var cwd = process.cwd();
 if (!cwd.endsWith(nativePathSep)) cwd = cwd + nativePathSep;
+var cwdReal = fs.realpathSync(cwd.slice(0, -1)) + nativePathSep;
 var emptyBuffer = Buffer.alloc(0);
+var folderSizeCacheFile = '.pad-folder-size.json';
+
+function hasPathPrefix(target, root) {
+  return target === root.slice(0, -1) || target.indexOf(root) === 0;
+}
+
+function getExistingRealPath(target) {
+  var current = target;
+  while (!fs.existsSync(current)) {
+    var parent = pathLib.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+  return fs.realpathSync(current);
+}
+
+function isPathInsideRoot(target) {
+  var realPath = getExistingRealPath(target);
+  return realPath ? hasPathPrefix(realPath, cwdReal) : false;
+}
+
+function isRequestPathAllowed(target, shouldExist) {
+  if (shouldExist) return isPathInsideRoot(target);
+  return isPathInsideRoot(pathLib.dirname(target));
+}
+
+function isPreviewable(mimeType) {
+  return /^(image|video|audio)\//.test(mimeType || '');
+}
+
+function getFolderSizeCachePath(target) {
+  return pathLib.join(target, folderSizeCacheFile);
+}
+
+function readFolderSizeCache(target, callback) {
+  fs.readFile(getFolderSizeCachePath(target), 'utf8', function (err, data) {
+    if (err) return callback(null, null);
+    try {
+      var parsed = JSON.parse(data);
+      return callback(null, typeof parsed.size === 'number' ? parsed.size : null);
+    } catch (e) {
+      return callback(null, null);
+    }
+  });
+}
+
+function writeFolderSizeCache(target, size, callback) {
+  fs.writeFile(getFolderSizeCachePath(target), JSON.stringify({
+    size: size,
+    updatedAt: Date.now()
+  }), 'utf8', function () {
+    if (callback) callback();
+  });
+}
+
+function invalidateFolderSizeCache(target) {
+  var current = fs.existsSync(target) && fs.statSync(target).isDirectory()
+    ? target
+    : pathLib.dirname(target);
+  while (hasPathPrefix(current, cwdReal)) {
+    try {
+      fs.unlinkSync(getFolderSizeCachePath(current));
+    } catch (e) {}
+    if (current === cwdReal.slice(0, -1)) break;
+    var parent = pathLib.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+}
+
+function calculateDirectorySize(target, callback) {
+  fs.readdir(target, function (err, items) {
+    if (err) return callback(err);
+    items = items.filter(function (item) { return item !== folderSizeCacheFile; });
+    var total = 0;
+    var pending = items.length;
+    if (!pending) return callback(null, 0);
+    items.forEach(function (item) {
+      var itemPath = pathLib.join(target, item);
+      fs.stat(itemPath, function (statErr, stats) {
+        if (statErr) return callback(statErr);
+        if (stats.isDirectory()) {
+          return calculateDirectorySize(itemPath, function (dirErr, dirSize) {
+            if (dirErr) return callback(dirErr);
+            total += dirSize;
+            if (--pending === 0) callback(null, total);
+          });
+        }
+        total += stats.size;
+        if (--pending === 0) callback(null, total);
+      });
+    });
+  });
+}
 
 var lastActivityTimestamp = Date.now();
 if (timeout !== -1) {
@@ -215,21 +310,70 @@ var server = (https ? function (requestListener) {
       return res.end();
     }
   }
+  var targetPath;
   if (cmd) {
     if (path.indexOf('/@cmd') === 0) {
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
       return exec(decodeURI(req.url).split('/@cmd/')[1] + ' 2>&1').stdout.pipe(res);
     }
   }
+  if (path.indexOf('/@size/') !== -1 || path.indexOf('/@size-refresh/') !== -1) {
+    var forceRefresh = path.indexOf('/@size-refresh/') !== -1;
+    path = path.replace('/@size-refresh/', '/').replace('/@size/', '/');
+    path = path.replace(/^[\/\\]+/, '').replace(/(^|[\/\\])\.\.(?=[\/\\]|$)/g, '');
+    targetPath = pathLib.resolve(cwd, path);
+    try {
+      if (!followOutsideLinks && !isRequestPathAllowed(targetPath, true)) {
+        res.writeHead(404);
+        return res.end('HTTP Error 404 File not found, invalid path');
+      }
+    } catch (e) {
+      res.writeHead(404);
+      return res.end('HTTP Error 404 File not found, error');
+    }
+    return fs.stat(targetPath, function (err, stats) {
+      if (err || !stats.isDirectory()) {
+        res.writeHead(404);
+        return res.end('HTTP Error 404 Directory not found');
+      }
+      return readFolderSizeCache(targetPath, function (cacheErr, cachedSize) {
+        if (!forceRefresh && cacheErr === null && typeof cachedSize === 'number') {
+          res.writeHead(200, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Access-Control-Allow-Origin': '*'
+          });
+          return res.end(JSON.stringify({ size: cachedSize, cached: true }));
+        }
+        return calculateDirectorySize(targetPath, function (sizeErr, size) {
+          if (sizeErr) {
+            res.writeHead(500);
+            return res.end('HTTP Error 500 Failed to calculate folder size');
+          }
+          return writeFolderSizeCache(targetPath, size, function () {
+            res.writeHead(200, {
+              'Content-Type': 'application/json; charset=utf-8',
+              'Access-Control-Allow-Origin': '*'
+            });
+            return res.end(JSON.stringify({ size: size, cached: false }));
+          });
+        });
+      });
+    });
+  }
   path = path.replace(/^[\/\\]+/, '').replace(/(^|[\/\\])\.\.(?=[\/\\]|$)/g, '');
+  targetPath = pathLib.resolve(cwd, path);
 
   if (allowRename && req.method === 'PATCH') {
     var from = path.split('@')[0];
     var to = path.split('@')[1];
     try {
-      if ((fs.realpathSync(from.replace(/[^\/\\]+$/, '')) + '/').indexOf(cwd) === 0 &&
-          (fs.realpathSync(to.replace(/[^\/\\]+$/, '')) + '/').indexOf(cwd) === 0) {
-        return fs.rename(cwd + from, cwd + to, function () {
+      var fromPath = pathLib.resolve(cwd, from);
+      var toPath = pathLib.resolve(cwd, to);
+      if (isPathInsideRoot(pathLib.dirname(fromPath)) &&
+          isPathInsideRoot(pathLib.dirname(toPath))) {
+        return fs.rename(fromPath, toPath, function () {
+          invalidateFolderSizeCache(fromPath);
+          invalidateFolderSizeCache(toPath);
           return res.end();
         });
       } else {
@@ -243,7 +387,8 @@ var server = (https ? function (requestListener) {
   }
 
   try {
-    if (!followOutsideLinks && (fs.realpathSync(path.replace(/[^\/\\]+$/, '')) + nativePathSep).indexOf(cwd) !== 0) {
+    var shouldExist = ['POST', 'PUT'].indexOf(req.method) === -1;
+    if (!followOutsideLinks && !isRequestPathAllowed(targetPath, shouldExist)) {
       res.writeHead(404);
       return res.end('HTTP Error 404 File not found, invalid path');
     }
@@ -254,45 +399,46 @@ var server = (https ? function (requestListener) {
   }
 
   if (allowDelete && req.method === 'DELETE') {
-    return fs.stat(cwd + path, function (err, stats) {
+    return fs.stat(targetPath, function (err, stats) {
       if (err) {
         console.error(err.message);
         return res.end('HTTP 404 File not found, invalid path to delete');
       }
       if (stats.isDirectory()) {
-        return fs.rmdir(cwd + path, function (err) {
+        return fs.rm(targetPath, { recursive: true, force: false }, function (err) {
           if (err) {
             res.writeHead(500);
             return res.end('HTTP Error 500 ' + err.message);
           }
+          invalidateFolderSizeCache(targetPath);
           res.end('OK');
         });
       }
-      return fs.unlink(cwd + path, function () {
+      return fs.unlink(targetPath, function (err) {
         if (err) {
           res.writeHead(500);
           return res.end('HTTP Error 500 ' + err.message);
         }
-        res.end();
+        invalidateFolderSizeCache(targetPath);
+        res.end('OK');
       });
     });
   }
 
   if (req.method === 'PUT') {
-    return fs.mkdir(cwd + path, function () {
+    return fs.mkdir(targetPath, { recursive: true }, function () {
+      invalidateFolderSizeCache(targetPath);
       return res.end();
     });
   }
 
   if (req.method === 'POST') {
-    if (followOutsideLinks) {
-      try {
-        fs.mkdirSync(pathLib.dirname(cwd + path), { recursive: true });
-      } catch (e) {
-        return res.end('HTTP 404 Failed to create parent folder');
-      }
+    try {
+      fs.mkdirSync(pathLib.dirname(targetPath), { recursive: true });
+    } catch (e) {
+      return res.end('HTTP 404 Failed to create parent folder');
     }
-    var writeStream = fs.createWriteStream(cwd + path, { flags: writeFlag });
+    var writeStream = fs.createWriteStream(targetPath, { flags: writeFlag });
     var isInError = false;
     writeStream.on('error', function (err) {
       isInError = true;
@@ -338,6 +484,7 @@ var server = (https ? function (requestListener) {
       writeStream.end();
 
       console.log('"' + path + '" SAVED!');
+      invalidateFolderSizeCache(targetPath);
       res.writeHead(200, {
         'Content-Type' : 'text/plain',
         'Access-Control-Allow-Origin': '*'
@@ -346,7 +493,7 @@ var server = (https ? function (requestListener) {
     });
   }
 
-  return fs.stat(cwd + path, function (err, stats) {
+  return fs.stat(targetPath, function (err, stats) {
     if (err) {
       console.error('"' + path + '" was requested but not found.');
       res.writeHead(404);
@@ -392,7 +539,7 @@ var server = (https ? function (requestListener) {
           'Content-Type': contentType,
           'Access-Control-Allow-Origin': '*'
         });
-        return fs.createReadStream(path, { start: start, end: end }).pipe(res);
+        return fs.createReadStream(targetPath, { start: start, end: end }).pipe(res);
       }
 
       console.log('"' + path + '" SERVED!');
@@ -402,7 +549,7 @@ var server = (https ? function (requestListener) {
         'Content-Type': contentType,
         'Access-Control-Allow-Origin': '*'
       });
-      return fs.createReadStream(path).pipe(res);
+      return fs.createReadStream(targetPath).pipe(res);
     }
 
     // so is a directory, create and serve directory index page
@@ -417,269 +564,1898 @@ var server = (https ? function (requestListener) {
       return res.end('Access is denied');
     }
 
-    return fs.readdir(cwd + path, function (err, dir) {
-      return res.end([
-        '<!DOCTYPE html>',
-        '<html>',
-        '<head>',
-        ' <meta charset="utf-8">',
-        ' <meta name="viewport" content="width=device-width, initial-scale=1">',
-        ' <meta name="color-scheme" content="light dark">',
-        ' <link rel="icon" href="data:,">',
-        ' <style>',
-          'td:nth-child(3), th:nth-child(3) { text-align: right; }',
-          'th, td { padding: 0 14px 0 0; } th { padding-bottom: 3px; }',
-          'a, a:active { text-decoration: none; }',
-          'a:hover, a:focus { text-decoration: underline; color: red; }',
-          'body { background-color: #F5F5F5; }',
-          '#main, #over { background-color: white; }',
-          // Used instead of light-dark for better backward compatibility
-          '@media (prefers-color-scheme: dark) {',
-          ' body, #main { background-color: transparent; }',
-          ' #over { background-color: black; }',
-          '}',
-          '@media (max-width: 800px) {',
-          '  table, tbody, tr { display: block; }',
-          '  td:nth-child(2), td:nth-child(4), thead { display: none; }',
-          '  td:nth-child(1), td:nth-child(3) { display: inline; }',
-          '  td:nth-child(3) { float: right; }',
-          '  input[type="file"] { font-size: 90%; }',
-          '}',
-        ' </style>',
-        ' <title>Index of ' + escapeHtml('/' + path) + '</title>',
-        '</head>',
-        '<body>',
-        (noUpload ? '' : ' <div style="float: right">' +
-          '<a onclick="createFolder(); return false;" href="#" title="Create a folder">📁</a> ' +
-          '<a onclick="noteSubmit(); return false;" href="#" title="Create a note">📝</a> ' +
-          '<form method="post" enctype="multipart/form-data" style="display: inline">' +
-            '<input type="file" name="fileToUpload" id="fileToUpload" multiple ' +
-              'onchange="if (window.FormData) upload(this.files); else {' +
-              '  var form = this.parentElement;' +
-              '  form.action = this.value.split(\'\\\\\').slice(-1)[0];' +
-              '  form.submit();' +
-              '}"></form></div>'),
-        ' <h2 style="margin-bottom: 12px;">Index of ' +
-          (path === '' ? '/' : '<a href="/">./</a>') +
-          path.split('/').map(function (x, i, arr) {
-            return '<a href="/' +
-              quoteattr(arr.slice(0, i + 1).join('/')) + '/">' +
-              escapeHtml(x) + '</a>';
-          }).join('/') + '</h2>',
-        ' <div id="main" style="' +
-          ' border-top: 1px solid #646464; border-bottom: 1px solid #646464;' +
-          ' padding-top: 10px; padding-bottom: 14px;">',
-        '  <table ellpadding="0" cellspacing="0" style="' +
-          'margin-left: 12px; font: 90% monospace; text-align: left;' +
-        '">', '   <thead>', '    <tr>',
-        '     <th onclick="sort(1); return false;"><a href="#">Name↓</a></a></th>',
-        '     <th onclick="sort(2); return false;"><a href="#">Last Modified:</a></th>',
-        '     <th onclick="sort(3); return false;"><a href="#">Size:</a></th>',
-        '     <th onclick="sort(4); return false;"><a href="#">Type:</a></th>',
-        '    </tr>', '   </thead>', '   <tbody>',
-        (path === '' ? [] : ['..']).concat(dir).map(function (x) {
-          var fileStats;
-          try {
-            fileStats = fs.statSync(cwd + path + x);
-          } catch (e) {
-            fileStats = { size: '', mtime: 0, isDirectory: function () { return false; } };
-          }
-          var ext = x.replace(/^.*\.(.*)$/, "$1");
+    return fs.readdir(targetPath, function (err, dir) {
+      if (err) {
+        res.writeHead(500);
+        return res.end('HTTP Error 500 Failed to read directory');
+      }
+
+      dir = dir.filter(function (x) { return x !== folderSizeCacheFile; });
+      var entries = (path === '' ? [] : ['..']).concat(dir).map(function (x) {
+        if (x === '..') {
           return {
-            name: x.toString(),
-            ext: ext,
-            size: fileStats.size,
-            date: new Date(fileStats.mtime),
-            isDir: fileStats.isDirectory()
+            name: '..',
+            href: '../',
+            size: 0,
+            date: 0,
+            dateText: '',
+            isDir: true,
+            typeText: 'Parent Directory',
+            previewUrl: '',
+            isParent: true
           };
-        }).sort(function (x, y) {
-          return x.isDir !== y.isDir
-            ? (x.isDir < y.isDir ? 1 : -1)
-            : (x.name > y.name ? 1 : -1);
-        }).map(function (x) {
-          return '   <tr>\n    <td>' +
-            (allowRename && x.name !== '..' && path === '' ?
-              '<a href="#" onclick="renameFile(this); return false;"' +
-              ' title="Rename" style="color: green; line-height: 0;">✍</a> ' : '') +
-            (allowDelete && x.name !== '..' ?
-              '<a href="#" onclick="deleteFile(this); return false;" title="Delete"' +
-              ' style="color: red">✗</a> ' : '') +
-            '<a href="' + quoteattr(x.name) + (x.isDir ? '/' : '') + '"' +
-              (allowRename && x.name !== '..' && path === '' ?
-                (x.isDir ? ' ondrop="dropHandler(event);" ondragover="dragOverHandler(event);"'
-                  : ' draggable="true" ondragstart="dragStart(event);"') :
-                  '') + '>' +
-            escapeHtml(x.name) + '</a>' + (x.isDir ? '/' : '') +
-            '</td>\n    ' +
-              (x.name === '..' ? '<td></td>' :
-                '<td title="' + x.date.getTime() + '">' +
-                x.date.toISOString().replace('T', ' ').split('.')[0] + '</td>') +
-            '\n    <td title="' + x.size + '">' +
-            (x.isDir ? '-&nbsp;&nbsp;' : fileSizeSI(x.size)) + '</td>' +
-            '\n    <td>' + (x.isDir ? 'Directory' : contentTypes[x.ext.toLowerCase()] || '') +
-            '</td>\n   </tr>';
-        }).join('\n'),
-        '  </tbody></table>',
-        ' </div>', ' <div style="' +
-        'font: 90% monospace; color: #787878; padding-top: 4px;' +
-        '">' + (noInfo ? '' : os.hostname() + ', ' + os.platform() + '/' + os.arch() +
-          ', memory: ' + fileSizeSI(os.totalmem()) + ', ') +
-          ' pad.js.org, ' +
-            (noUpload ? '' : 'supports upload by drag-and-drop and copy-and-paste, ') +
-            'your IP is: ' +
-            req.connection.remoteAddress + ' ' +
-            (req.headers['x-forwarded-for'] || '') + '</div>' +
-            (cmd && path === ''
-              ? '<br><input placeholder="Enter your command here and press enter" ' +
-                'style="float: right; width: 250px" ' +
-                'onkeypress="if (event.which === 13) location.href += \'@cmd/\' + this.value;">'
-              : ''), ' <script>',
-        '"use strict";',
-        'document.addEventListener("dragover", function (e) {',
-        '  e.stopPropagation(); e.preventDefault();',
-        allowRename ? '  return;' : '', // don't add overlay on the case, we have other uses
-        '  if (!document.getElementById("over"))',
-        '    document.body.innerHTML += "<pre id=\'over\' style=\'top: 0; right: 0; ' +
-              'width: 100%; height: 100%; opacity: .9; position: absolute; margin: 0; ' +
-              'text-align: center; padding-top: 10em;' +
-              '\'>&hellip;drop anything here&hellip;</pre>";',
-        '}, false);',
-        'document.addEventListener("dragleave", function (e) {',
-        '  e.stopPropagation(); e.preventDefault();',
-        '  if (document.getElementById("over")) document.getElementById("over").remove();',
-        '}, false);',
-        'document.addEventListener("drop", function (e) {',
-        '  e.stopPropagation(); e.preventDefault();',
-        '  if (document.getElementById("over")) document.getElementById("over").remove();',
-        '  handleDataTransfer(e.dataTransfer);',
-        '});',
-        'document.body.addEventListener("paste", function (e) {',
-        '  if (e.target.nodeName !== "INPUT")', // don't interfere with input elements
-        '    handleDataTransfer(e.clipboardData);',
-        '});',
-        'function noteSubmit(text) {',
-        '  text = text || prompt("Enter a note:");',
-        '  if (!text) return;',
-        // fakemime as we split second part for the upload extension which is okay most of the times
-        '  upload([new Blob([text], { type: "fakemime/txt" })]);',
-        '}',
-        'function request(callback, url, method, body, onProgress) {',
-        '  var xhr = new XMLHttpRequest();',
-        '  xhr.open(method, url);',
-        '  xhr.onload = function () {',
-        '    if (xhr.readyState === xhr.DONE) {',
-        '      if (xhr.status !== 200) alert(xhr.responseText);',
-        '      callback(xhr.responseText, xhr.status);',
-        '    }',
-        '  };',
-        '  xhr.onerror = function (err) { alert(err); callback(err); };',
-        '  if (xhr.upload && onProgress)',
-        '    xhr.upload.onprogress = onProgress;',
-        '  xhr.withCredentials = true;',
-        '  xhr.send(body);',
-        '}',
-        'function createFolder() {',
-        '  var name = prompt("Enter folder name:");',
-        '  if (!name) return;',
-        '  request(function () { location.reload(); }, encodeURIComponent(name), "PUT");',
-        '}',
-        'function deleteFile(element) {',
-        '  var name = element.parentElement.lastElementChild.textContent;',
-        '  request(function (msg, status) {',
-        '    if (status === 200)',
-        '      element.parentElement.parentElement.parentElement.removeChild(element.parentElement.parentElement);',
-        '  }, encodeURIComponent(name), "DELETE");',
-        '}',
-        'function dragStart(ev) {',
-        '  ev.dataTransfer.setData("text/plain", ev.target.textContent);',
-        '}',
-        'function dropHandler(ev) {',
-        '  ev.preventDefault();',
-        '  var source = ev.dataTransfer.getData("text");',
-        '  var target = ev.target.textContent;',
-        '  request(function () { location.reload(); },',
-        '    encodeURIComponent(source) +',
-        '    "@" + encodeURIComponent(target) + "/" + encodeURIComponent(source), "PATCH");',
-        '}',
-        'function dragOverHandler(ev) {',
-        '  ev.preventDefault();',
-        '  ev.dataTransfer.dropEffect = "move";',
-        '}',
-        'function renameFile(element) {',
-        '  var entry = element.parentElement.lastElementChild;',
-        '  entry.draggable = false;', // https://stackoverflow.com/q/10317128
-        '  var from = entry.textContent;',
-        '  entry.contentEditable = true;',
-        '  entry.focus();',
-        '  entry.onkeypress = function (e) {',
-        '    if (e.which === 13 || e.which === 27) entry.blur();',
-        '    if (e.which !== 13) return;',
-        '    e.preventDefault();',
-        '    var to = entry.textContent;',
-        '    request(function () { location.reload(); },',
-        '      encodeURIComponent(from) + "@" + encodeURIComponent(to), "PATCH");',
-        '  };',
-        '  entry.onblur = function (e) {',
-        '    entry.contentEditable = false;',
-        '    entry.draggable = true;',
-        '  };',
-        '}',
-        'function handleDataTransfer(dataTransfer) {',
-        '  if (dataTransfer.files.length) upload(dataTransfer.files);',
-        '  else if ((dataTransfer.items || [{}])[0].kind === "string")',
-        '    dataTransfer.items[0].getAsString(noteSubmit);',
-        '}',
-        'function upload(files) {',
-        '  document.body.innerHTML += "<pre id=\'over\' style=\'top: 0; right: 0; ' +
-            'width: 100%; height: 100%; opacity: .9; position: absolute; margin: 0; ' +
-            'text-align: center; padding-top: 10em;' +
-            '\'>Uploading&hellip;<br>' +
-            '<div style=\'margin: 0 auto; width: 200px; background-color: #DDD\'>' +
-            '<div id=\'bar\' style=\'height: 30px; background-color: #4CAF50\'>' +
-            '</div></div></pre>";',
-        '  var jobs = Array.prototype.slice.call(files).map(function (file) {',
-        '    return function (callback) {',
-        '      var name = file.name;',
-        '      if (!name || name.split(".")[0] === "image")', // image.{png,jpeg,...}
-        '        name = Date.now() + "." + file.type.split("/")[1];',
-        '      var formData = new FormData();',
-        '      formData.append("blob", file);',
-        '      document.getElementById("over").innerHTML += "<div>" + name + "&hellip;</div>";',
-        '      request(callback, encodeURIComponent(name), "POST", formData, function (e) {',
-        '        document.getElementById("bar").style.width = e.loaded / e.total * 100 + "%";',
-        '      });',
-        '    };',
-        '  });',
-        '  (function reactor() {',
-        '    (jobs.shift() || function () { location.reload(); })(reactor);',
-        '  }());',
-        '}',
-        'var sortState = 1;',
-        'function sort(ord) {',
-        '  sortState = ord === sortState ? -ord : ord;',
-        '  var p = document.getElementsByTagName("tbody")[0];',
-        // http://stackoverflow.com/a/39569822
-        '  Array.prototype.slice.call(p.children)',
-        '    .map(function (x) { return p.removeChild(x); })',
-        '    .sort(function (x, y) {',
-        '      x = x.getElementsByTagName("td");',
-        '      y = y.getElementsByTagName("td");',
-        '      var xDir = x[3].textContent === "Directory";',
-        '      var yDir = y[3].textContent === "Directory";',
-        '      if (xDir !== yDir) return xDir < yDir ? 1 : -1;',
-        '      if (x[0].textContent === "../") return -1;',
-        '      if (y[0].textContent === "../") return 1;',
-        '      if (ord === 2 || ord === 3)',
-        '        return +x[ord - 1].title > +y[ord - 1].title ? sortState : -sortState;',
-        '      return x[ord - 1].textContent > y[ord - 1].textContent ? sortState : -sortState;',
-        '    }).forEach(function (x) { p.appendChild(x); });',
-        '  Array.prototype.slice.call(document.getElementsByTagName("th")).forEach(function (x, i) {',
-        '    x.firstChild.textContent = x.firstChild.textContent.replace(/.$/, i === ord - 1',
-        '      ? (sortState < 0 ? "↑" : "↓") : ":");',
-        '  });',
-        '}',
-        ' </script>', '</body>', '</html>'
-      ].join('\n'));
+        }
+        var fileStats;
+        try {
+          fileStats = fs.statSync(pathLib.join(targetPath, x));
+        } catch (e) {
+          fileStats = { size: 0, mtime: 0, isDirectory: function () { return false; } };
+        }
+        var ext = x.replace(/^.*\.(.*)$/, "$1");
+        var typeText = fileStats.isDirectory() ? 'Directory' : (contentTypes[ext.toLowerCase()] || '');
+        return {
+          name: x.toString(),
+          href: encodeURIComponent(x) + (fileStats.isDirectory() ? '/' : ''),
+          size: fileStats.size || 0,
+          folderSize: null,
+          date: +(new Date(fileStats.mtime)) || 0,
+          dateText: fileStats.mtime ? new Date(fileStats.mtime).toISOString().replace('T', ' ').split('.')[0] : '',
+          isDir: fileStats.isDirectory(),
+          typeText: typeText,
+          previewUrl: !fileStats.isDirectory() && isPreviewable(typeText) ? encodeURIComponent(x) : '',
+          isParent: false
+        };
+      });
+
+      var breadcrumbHtml = path === '' ? '/' : '<a href="/">./</a>' + path.split('/').map(function (x, i, arr) {
+        return '<a href="/' + quoteattr(arr.slice(0, i + 1).join('/')) + '/">' + escapeHtml(x) + '</a>';
+      }).join('/');
+      var footerInfo = (noInfo ? '' : os.hostname() + ', ' + os.platform() + '/' + os.arch() +
+        ', memory: ' + fileSizeSI(os.totalmem()) + ', ') +
+        'pad.js.org, ' + (noUpload ? '' : 'supports upload by drag-and-drop, folders, and copy-and-paste, ') +
+        'your IP is: ' + req.connection.remoteAddress + ' ' + (req.headers['x-forwarded-for'] || '');
+
+      return res.end(`<!DOCTYPE html>
+<html>
+<head>
+ <meta charset="utf-8">
+ <meta name="viewport" content="width=device-width, initial-scale=1">
+ <meta name="color-scheme" content="light dark">
+ <link rel="icon" href="data:,">
+ <title>Index of ${escapeHtml('/' + path)}</title>
+ <style>
+  :root {
+    --bg: #f3efe7;
+    --panel: rgba(255, 252, 246, 0.96);
+    --panel-strong: #ffffff;
+    --text: #1f2933;
+    --muted: #617080;
+    --border: rgba(57, 74, 93, 0.18);
+    --accent: #1d6d5f;
+    --accent-soft: rgba(29, 109, 95, 0.12);
+    --danger: #be3a34;
+    --shadow: 0 18px 40px rgba(62, 76, 92, 0.12);
+  }
+  :root[data-theme="dark"] {
+    --bg: #11151c;
+    --panel: rgba(24, 30, 40, 0.95);
+    --panel-strong: #18202b;
+    --text: #edf2f7;
+    --muted: #9fb0c2;
+    --border: rgba(178, 193, 209, 0.16);
+    --accent: #6bd3bf;
+    --accent-soft: rgba(107, 211, 191, 0.14);
+    --danger: #ff8a7a;
+    --shadow: 0 22px 48px rgba(0, 0, 0, 0.35);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Avenir Next", "Hiragino Sans", "Yu Gothic", sans-serif;
+    color: var(--text);
+    background: linear-gradient(180deg, var(--bg), color-mix(in srgb, var(--bg) 86%, black 14%));
+    min-height: 100vh;
+  }
+  :root:not([data-theme="dark"]) body {
+    background:
+      radial-gradient(circle at top left, rgba(255, 255, 255, 0.62), transparent 26%),
+      linear-gradient(180deg, var(--bg), color-mix(in srgb, var(--bg) 86%, black 14%));
+  }
+  a { color: inherit; text-decoration: none; }
+  a:hover, a:focus { color: var(--accent); }
+  .shell {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 24px 18px 72px;
+  }
+  .hero, .panel, .tasks {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    box-shadow: var(--shadow);
+    backdrop-filter: blur(12px);
+  }
+  .hero {
+    padding: 12px 14px;
+    margin-bottom: 12px;
+    position: sticky;
+    top: 8px;
+    z-index: 40;
+    transition: padding 160ms ease, width 160ms ease, max-width 160ms ease, box-shadow 160ms ease;
+  }
+  .hero-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .hero h1 {
+    margin: 0;
+    font-size: clamp(1.05rem, 2.3vw, 1.45rem);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .menu-toggle {
+    width: 34px;
+    min-width: 34px;
+    height: 34px;
+    padding: 0;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--panel-strong);
+    color: var(--text);
+    cursor: pointer;
+    font: inherit;
+  }
+  .menu-toggle:hover {
+    background: var(--accent-soft);
+  }
+  .toolbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px 12px;
+    align-items: start;
+    margin-top: 10px;
+  }
+  .hero.menu-collapsed {
+    width: 100%;
+    max-width: none;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    cursor: pointer;
+  }
+  .hero.menu-collapsed .toolbar {
+    display: none;
+  }
+  .hero.menu-collapsed .hero-head {
+    gap: 10px;
+  }
+  .hero.menu-collapsed:hover {
+    box-shadow: 0 20px 42px rgba(62, 76, 92, 0.16);
+  }
+  .toolbar-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+  }
+  .button, .toolbar label.select, select, .toggle {
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--panel-strong);
+    color: var(--text);
+    font: inherit;
+  }
+  .button, .toolbar label.select, .toggle {
+    padding: 7px 10px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    min-height: 34px;
+    font-size: 0.84rem;
+  }
+  .button.primary {
+    background: var(--accent);
+    color: white;
+    border-color: transparent;
+    box-shadow: none;
+  }
+  select {
+    padding: 7px 10px;
+    min-height: 34px;
+    font-size: 0.84rem;
+  }
+  .toolbar label.select {
+    padding-right: 8px;
+  }
+  .toolbar label.select,
+  .toggle {
+    color: var(--muted);
+  }
+  .toolbar label.select select,
+  .toggle input {
+    margin-left: 4px;
+  }
+  .toggle {
+    min-width: 92px;
+    justify-content: center;
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+  .toggle.disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  .toggle input {
+    margin-left: 0;
+    margin-right: 2px;
+  }
+  .quick-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .icon-action {
+    width: 34px;
+    min-width: 34px;
+    justify-content: center;
+    padding: 0;
+    font-size: 1rem;
+  }
+  .icon-action.primary {
+    font-size: 0.95rem;
+  }
+  .toolbar-controls {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .toolbar-controls > * {
+    height: 34px;
+    box-sizing: border-box;
+  }
+  .grid-size-control {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 132px;
+    padding: 0 10px;
+  }
+  .grid-size-control input[type="range"] {
+    width: 84px;
+    margin: 0;
+  }
+  .grid-size-control .label-icon {
+    color: var(--muted);
+    line-height: 1;
+  }
+  .grid-size-control.disabled {
+    opacity: 0.45;
+  }
+  .compact-select {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 8px;
+    min-width: 92px;
+  }
+  .compact-select .label-icon {
+    color: var(--muted);
+    font-size: 0.95rem;
+    line-height: 1;
+  }
+  .compact-select select {
+    border: 0;
+    background: transparent;
+    padding: 0;
+    min-height: 32px;
+    min-width: 0;
+    width: 100%;
+  }
+  .compact-select select:focus {
+    outline: none;
+  }
+  input[type="checkbox"] { accent-color: var(--accent); }
+  .panel {
+    overflow: hidden;
+  }
+  .list-header {
+    display: grid;
+    grid-template-columns: minmax(240px, 2.4fr) 1.1fr 0.7fr 1fr;
+    gap: 12px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 0.86rem;
+  }
+  .list-header button {
+    all: unset;
+    cursor: pointer;
+  }
+  .entries {
+    display: grid;
+    gap: 12px;
+    padding: 18px;
+    --grid-size: 220px;
+    --grid-scale: 1;
+    --item-scale: 1;
+  }
+  .entries[data-view="simple"] {
+    gap: 0;
+    padding: 6px 10px 8px;
+  }
+  .entries[data-view="simple"] .entry {
+    display: block;
+    align-items: center;
+    padding: 4px 2px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+  .entries[data-view="simple"] .entry::after {
+    display: none;
+  }
+  .entries[data-view="simple"] .entry + .entry {
+    border-top: 1px solid var(--border);
+  }
+  .entries[data-view="simple"] .entry-main {
+    min-width: 0;
+  }
+  .entries[data-view="simple"] .entry-main-content {
+    gap: calc(10px * var(--item-scale));
+  }
+  .entries[data-view="simple"] .entry-thumb {
+    width: calc(28px * var(--item-scale));
+    height: calc(28px * var(--item-scale));
+    flex-basis: calc(28px * var(--item-scale));
+    border-radius: calc(8px * var(--item-scale));
+    font-size: calc(0.9rem * var(--item-scale));
+  }
+  .entries[data-view="simple"] .entry-meta {
+    gap: 1px;
+  }
+  .entries[data-view="simple"] .entry-name {
+    font-size: calc(0.86rem * var(--item-scale));
+    line-height: 1.15;
+  }
+  .entries[data-view="simple"] .entry-sub {
+    display: none;
+  }
+  .entries[data-view="simple"] .entry-col {
+    display: none;
+  }
+  .entries[data-view="simple"] .entry-actions {
+    margin-left: calc(8px * var(--item-scale));
+  }
+  .entries[data-view="simple"] .icon-button {
+    width: calc(28px * var(--item-scale));
+    height: calc(28px * var(--item-scale));
+    border-radius: calc(8px * var(--item-scale));
+    font-size: calc(0.85rem * var(--item-scale));
+  }
+  .entries[data-view="simple"] .entry-link {
+    inset: -4px;
+    border-radius: calc(10px * var(--item-scale));
+  }
+  .entries[data-view="list"] .entry {
+    display: grid;
+    grid-template-columns: minmax(240px, 2.4fr) 1.1fr 0.7fr 1fr;
+    gap: calc(12px * var(--item-scale));
+    align-items: center;
+  }
+  .entries[data-view="grid"] {
+    grid-template-columns: repeat(auto-fill, minmax(var(--grid-size), 1fr));
+  }
+  .entries[data-view="gallery"] {
+    grid-template-columns: repeat(auto-fill, minmax(var(--grid-size), 1fr));
+    gap: calc(8px * var(--grid-scale));
+  }
+  .entries[data-view="gallery"] .entry {
+    padding: calc(6px * var(--grid-scale));
+    min-height: auto;
+  }
+  .entries[data-view="gallery"] .entry::after,
+  .entries[data-view="gallery"] .entry-meta,
+  .entries[data-view="gallery"] .entry-col {
+    display: none;
+  }
+  .entries[data-view="gallery"] .entry.is-directory .entry-meta {
+    display: block;
+  }
+  .entries[data-view="gallery"] .entry-main,
+  .entries[data-view="gallery"] .entry-main-content {
+    display: block;
+  }
+  .entries[data-view="gallery"] .entry-thumb {
+    width: 100%;
+    height: calc(170px * var(--grid-scale));
+    flex-basis: calc(170px * var(--grid-scale));
+    border-radius: calc(14px * var(--grid-scale));
+  }
+  .entries[data-view="gallery"] .entry-link {
+    inset: 0;
+    border-radius: calc(14px * var(--grid-scale));
+  }
+  .entries[data-view="gallery"] .entry.is-directory .entry-link {
+    inset: -2px;
+  }
+  .entries[data-view="gallery"] .entry.is-directory .entry-main-content {
+    display: flex;
+    flex-direction: column;
+    gap: calc(8px * var(--grid-scale));
+  }
+  .entries[data-view="gallery"] .entry.is-directory .entry-thumb {
+    height: calc(118px * var(--grid-scale));
+    flex-basis: calc(118px * var(--grid-scale));
+  }
+  .entries[data-view="gallery"] .entry.is-directory .entry-meta {
+    position: relative;
+    z-index: 1;
+    width: 100%;
+  }
+  .entries[data-view="gallery"] .entry.is-directory .entry-top {
+    display: block !important;
+  }
+  .entries[data-view="gallery"] .entry.is-directory .entry-name {
+    display: block;
+    font-size: calc(0.9rem * var(--grid-scale));
+    line-height: 1.2;
+    text-align: center;
+  }
+  .entries[data-view="gallery"] .entry-actions {
+    position: absolute;
+    top: calc(8px * var(--grid-scale));
+    right: calc(8px * var(--grid-scale));
+    margin-left: 0;
+    margin-top: 0;
+  }
+  .entries[data-view="gallery"] .icon-button {
+    width: calc(30px * var(--grid-scale));
+    height: calc(30px * var(--grid-scale));
+    font-size: calc(0.92rem * var(--grid-scale));
+    background: rgba(16, 20, 28, 0.62);
+    color: white;
+  }
+  .entries[data-view="grid"] .entry {
+    display: flex;
+    flex-direction: column;
+    min-height: calc(260px * var(--grid-scale));
+  }
+  .entries[data-view="grid"] .entry-main {
+    display: block;
+  }
+  .entry {
+    background: var(--panel-strong);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    padding: calc(12px * var(--item-scale));
+    position: relative;
+    overflow: hidden;
+  }
+  .entry::after {
+    content: "";
+    position: absolute;
+    inset: auto -20% -60% 40%;
+    height: 80px;
+    background: linear-gradient(90deg, transparent, var(--accent-soft));
+    pointer-events: none;
+  }
+  .entry-main {
+    display: flex;
+    gap: calc(12px * var(--item-scale));
+    align-items: center;
+    min-width: 0;
+    position: relative;
+  }
+  .entry-thumb {
+    width: calc(64px * var(--item-scale));
+    height: calc(64px * var(--item-scale));
+    flex: 0 0 calc(64px * var(--item-scale));
+    border-radius: calc(16px * var(--item-scale));
+    background: var(--accent-soft);
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    font-size: calc(1.5rem * var(--item-scale));
+  }
+  .entries[data-view="grid"] .entry-thumb {
+    width: 100%;
+    height: calc(132px * var(--grid-scale));
+    flex-basis: calc(132px * var(--grid-scale));
+  }
+  .entries[data-view="grid"] .entry-main-content {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+  .entry-thumb img, .entry-thumb video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  .entry-meta {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: calc(4px * var(--item-scale));
+    flex: 1 1 auto;
+  }
+  .entry-name {
+    font-weight: 700;
+    overflow-wrap: anywhere;
+    position: relative;
+    z-index: 1;
+    font-size: calc(1rem * var(--item-scale));
+  }
+  .entry-sub {
+    color: var(--muted);
+    font-size: calc(0.85rem * var(--item-scale));
+  }
+  .entry-link {
+    position: absolute;
+    inset: -8px;
+    border-radius: 16px;
+    z-index: 0;
+  }
+  .entry-link:hover,
+  .entry-link:focus-visible {
+    background: var(--accent-soft);
+    outline: none;
+  }
+  .entry-main-content {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    min-width: 0;
+    width: 100%;
+    pointer-events: none;
+  }
+  .entry-main-content .entry-meta,
+  .entry-main-content .entry-thumb,
+  .entry-main-content .entry-name,
+  .entry-main-content .entry-sub {
+    pointer-events: none;
+  }
+  .entry-col {
+    color: var(--muted);
+    font-size: calc(0.84rem * var(--item-scale));
+    overflow-wrap: anywhere;
+  }
+  .entry-actions {
+    display: inline-flex;
+    gap: calc(6px * var(--item-scale));
+    margin-left: calc(10px * var(--item-scale));
+    position: relative;
+    z-index: 3;
+    pointer-events: auto;
+  }
+  .entries[data-view="grid"] .entry-actions {
+    margin-left: 0;
+    margin-top: 8px;
+  }
+  .entries[data-view="grid"] .entry-meta {
+    margin-top: 0;
+    width: 100%;
+  }
+  .entries[data-view="grid"] .entry-top {
+    display: flex !important;
+    flex-direction: column;
+    align-items: flex-start !important;
+    gap: 8px !important;
+  }
+  .entries[data-view="grid"] .entry-name {
+    display: block;
+    padding-right: 0;
+    font-size: calc(1rem * var(--grid-scale));
+    line-height: 1.15;
+  }
+  .entries[data-view="grid"] .entry-sub {
+    font-size: calc(0.85rem * var(--grid-scale));
+  }
+  .entries[data-view="grid"] .entry-col {
+    font-size: calc(0.82rem * var(--grid-scale));
+    margin-top: calc(8px * var(--grid-scale));
+  }
+  .entries[data-view="grid"] .entry {
+    padding: calc(12px * var(--grid-scale));
+  }
+  .entries[data-view="grid"] .entry-thumb {
+    border-radius: calc(16px * var(--grid-scale));
+  }
+  .entries[data-view="grid"] .entry-main-content {
+    gap: calc(10px * var(--grid-scale));
+  }
+  .entries[data-view="grid"] .icon-button {
+    width: calc(34px * var(--grid-scale));
+    height: calc(34px * var(--grid-scale));
+    font-size: calc(1rem * var(--grid-scale));
+  }
+  .icon-button {
+    border: 0;
+    background: color-mix(in srgb, var(--panel-strong) 74%, var(--accent-soft) 26%);
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    width: calc(34px * var(--item-scale));
+    height: calc(34px * var(--item-scale));
+    padding: 0;
+    border-radius: calc(10px * var(--item-scale));
+    font-size: calc(1rem * var(--item-scale));
+  }
+  .icon-button:hover {
+    background: var(--accent-soft);
+  }
+  .icon-button.danger { color: var(--danger); }
+  .icon-button.rename { color: var(--accent); }
+  .hidden-header { display: none; }
+  .tasks {
+    position: fixed;
+    right: 18px;
+    bottom: 18px;
+    width: min(380px, calc(100vw - 24px));
+    max-height: 60vh;
+    overflow: auto;
+    padding: 14px;
+    z-index: 30;
+  }
+  .tasks:empty { display: none; }
+  .task {
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 12px;
+    background: var(--panel-strong);
+  }
+  .task + .task { margin-top: 10px; }
+  .task-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 8px;
+    font-size: 0.92rem;
+  }
+  .task-status { color: var(--muted); }
+  .progress {
+    width: 100%;
+    height: 9px;
+    border-radius: 999px;
+    overflow: hidden;
+    background: var(--accent-soft);
+  }
+  .progress-bar {
+    height: 100%;
+    width: 0;
+    background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 70%, white 30%));
+  }
+  .drop-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    display: none;
+    place-items: center;
+    padding: 24px;
+    background: rgba(10, 12, 18, 0.28);
+    backdrop-filter: blur(8px);
+  }
+  .drop-overlay.active { display: grid; }
+  .drop-overlay strong {
+    display: inline-block;
+    padding: 26px 36px;
+    border-radius: 22px;
+    background: var(--panel);
+    border: 1px dashed var(--accent);
+    box-shadow: var(--shadow);
+  }
+  .preview-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(7, 10, 16, 0.72);
+    backdrop-filter: blur(12px);
+  }
+  .preview-modal.open {
+    display: flex;
+  }
+  .preview-dialog {
+    width: min(1100px, 100%);
+    height: min(820px, calc(100vh - 48px));
+    max-height: calc(100vh - 48px);
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 280px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 24px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .preview-stage {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 0;
+    padding: 20px;
+    background: color-mix(in srgb, var(--panel-strong) 82%, black 18%);
+  }
+  .preview-content {
+    width: 100%;
+    height: 100%;
+    max-width: 100%;
+    max-height: 100%;
+    border-radius: 16px;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .preview-content img,
+  .preview-content video {
+    display: block;
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+  }
+  .preview-content audio {
+    width: min(520px, 100%);
+  }
+  .preview-side {
+    border-left: 1px solid var(--border);
+    background: var(--panel-strong);
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    overflow: auto;
+  }
+  .preview-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    min-height: 0;
+  }
+  .preview-side h3 {
+    margin: 0;
+    font-size: 1rem;
+    overflow-wrap: anywhere;
+  }
+  .preview-side p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.86rem;
+    overflow-wrap: anywhere;
+  }
+  .preview-actions {
+    display: grid;
+    gap: 8px;
+  }
+  .preview-actions.secondary {
+    grid-template-columns: 1fr 1fr;
+  }
+  .preview-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-height: 40px;
+    padding: 0 12px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+  }
+  .preview-button.primary {
+    background: var(--accent);
+    border-color: transparent;
+    color: white;
+  }
+  .preview-close,
+  .preview-nav {
+    position: absolute;
+    width: 42px;
+    height: 42px;
+    border: 0;
+    border-radius: 999px;
+    background: rgba(15, 18, 24, 0.58);
+    color: white;
+    cursor: pointer;
+    font: inherit;
+    z-index: 2;
+  }
+  .preview-close {
+    top: 16px;
+    right: 16px;
+  }
+  .preview-nav {
+    top: 50%;
+    transform: translateY(-50%);
+  }
+  .preview-prev {
+    left: 16px;
+  }
+  .preview-next {
+    right: 16px;
+  }
+  .preview-counter {
+    color: var(--muted);
+    font-size: 0.82rem;
+  }
+  .footer {
+    color: var(--muted);
+    font-size: 0.86rem;
+    margin-top: 14px;
+  }
+  [data-view="grid"] .entry-meta {
+    margin-top: 12px;
+  }
+  [data-view="grid"] .entry-main {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  [data-view="grid"] .entry-link {
+    inset: -6px -6px auto -6px;
+    bottom: 64px;
+  }
+  [data-view="grid"] .entry.is-directory .entry-link {
+    bottom: auto;
+    height: calc(132px * var(--grid-scale) + 12px);
+  }
+  @media (max-width: 860px) {
+    .shell { padding: 16px 12px 90px; }
+    .hero { padding: 14px; }
+    .hero.menu-collapsed {
+      width: 100%;
+      max-width: none;
+    }
+    .toolbar {
+      grid-template-columns: 1fr;
+    }
+    .toolbar-controls {
+      justify-content: flex-start;
+    }
+    .button, .toolbar label.select, .toggle, select {
+      min-height: 40px;
+    }
+    .toolbar-controls > * {
+      height: 40px;
+    }
+    .menu-toggle {
+      width: 40px;
+      min-width: 40px;
+      height: 40px;
+    }
+    .icon-action {
+      width: 40px;
+      min-width: 40px;
+    }
+    .list-header { display: none; }
+    .entries[data-view="simple"],
+    .entries[data-view="list"] {
+      grid-template-columns: 1fr;
+    }
+    .entries[data-view="simple"] .entry,
+    .entries[data-view="list"] .entry {
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+    .entries[data-view="simple"] {
+      padding: 4px 8px 6px;
+    }
+    .entry-col {
+      margin-left: 76px;
+      padding-right: 4px;
+    }
+    .entries[data-view="simple"] .entry-col {
+      display: none;
+    }
+    .entries[data-view="grid"] .entry-col { margin-left: 0; }
+    .tasks {
+      right: 12px;
+      left: 12px;
+      width: auto;
+      bottom: 12px;
+      max-height: 42vh;
+    }
+    .preview-dialog {
+      grid-template-columns: 1fr;
+      height: min(900px, calc(100vh - 24px));
+      max-height: calc(100vh - 24px);
+      grid-template-rows: minmax(0, 1fr) auto;
+    }
+    .preview-side {
+      border-left: 0;
+      border-top: 1px solid var(--border);
+      display: grid;
+      grid-template-rows: auto auto auto;
+      align-content: start;
+    }
+  }
+  @media (max-width: 560px) {
+    .hero p { display: none; }
+    .hero-head {
+      align-items: baseline;
+    }
+    .quick-actions,
+    .toolbar-controls {
+      display: flex;
+      flex-wrap: wrap;
+      width: 100%;
+    }
+    .toolbar-controls label.select {
+      flex: 1 1 calc(50% - 4px);
+      min-width: 0;
+    }
+    .grid-size-control {
+      flex: 1 1 100%;
+      min-width: 0;
+      justify-content: center;
+    }
+    .toggle {
+      flex: 1 1 calc(50% - 4px);
+      min-width: 0;
+    }
+    .quick-actions {
+      gap: 6px;
+    }
+    .quick-actions .button {
+      justify-content: center;
+    }
+    .entries {
+      padding: 12px;
+      gap: 10px;
+    }
+    .entry {
+      padding: 10px;
+      border-radius: 16px;
+    }
+    .entries[data-view="simple"] .entry {
+      padding: 3px 1px;
+      border-radius: 0;
+    }
+    .entry-main-content {
+      align-items: flex-start;
+    }
+    .entry-thumb {
+      width: 56px;
+      height: 56px;
+      flex-basis: 56px;
+    }
+    .entry-actions {
+      margin-left: 6px;
+    }
+    .entries[data-view="simple"] .entry-thumb {
+      width: calc(24px * var(--item-scale));
+      height: calc(24px * var(--item-scale));
+      flex-basis: calc(24px * var(--item-scale));
+    }
+    .entry-col {
+      margin-left: 68px;
+      font-size: 0.8rem;
+    }
+    .entries[data-view="simple"] .entry-col {
+      display: none;
+    }
+    .preview-modal {
+      padding: 10px;
+    }
+    .preview-stage {
+      height: min(52vh, 360px);
+      min-height: 220px;
+      padding: 12px;
+    }
+    .preview-side {
+      gap: 10px;
+      max-height: 240px;
+    }
+    .preview-meta {
+      min-height: 84px;
+      justify-content: space-between;
+    }
+    .preview-actions.primary-actions {
+      margin-top: 0;
+    }
+    .preview-close,
+    .preview-nav {
+      width: 38px;
+      height: 38px;
+    }
+  }
+ </style>
+</head>
+ <body>
+ <div class="shell">
+  <section class="hero">
+   <div class="hero-head">
+   <div>
+     <h1>Index of ${breadcrumbHtml}</h1>
+    </div>
+    <button class="menu-toggle" id="menuToggle" title="メニューを開閉" aria-label="メニューを開閉">☰</button>
+   </div>
+   <div class="toolbar">
+    <div class="toolbar-group quick-actions">
+     ${noUpload ? '' : '<button class="button primary icon-action" title="ファイルを追加" aria-label="ファイルを追加" onclick="document.getElementById(\'fileInput\').click(); return false;">↑</button><input id="fileInput" type="file" multiple hidden>'}
+     ${noUpload ? '' : '<button class="button icon-action" title="フォルダを追加" aria-label="フォルダを追加" onclick="document.getElementById(\'folderInput\').click(); return false;">📁</button><input id="folderInput" type="file" webkitdirectory directory multiple hidden>'}
+     ${noUpload ? '' : '<button class="button icon-action" title="新しいフォルダ" aria-label="新しいフォルダ" onclick="createFolder(); return false;">＋</button><button class="button icon-action" title="ノート作成" aria-label="ノート作成" onclick="noteSubmit(); return false;">✎</button>'}
+    </div>
+    <div class="toolbar-group toolbar-controls">
+     <label class="select compact-select" title="表示">
+      <span class="label-icon">☰</span>
+      <select id="viewMode">
+      <option value="simple">簡易</option>
+       <option value="list">リスト</option>
+       <option value="grid">グリッド</option>
+       <option value="gallery">ギャラリー</option>
+      </select>
+     </label>
+     <label class="toggle" title="サムネイル表示"><input id="thumbToggle" type="checkbox"><span>🖼</span></label>
+     <label class="select compact-select" title="テーマ">
+      <span class="label-icon">◐</span>
+      <select id="themeMode">
+       <option value="auto">自動</option>
+       <option value="light">ライト</option>
+       <option value="dark">ダーク</option>
+      </select>
+     </label>
+     <label class="select compact-select" title="並び順">
+      <span class="label-icon">⇅</span>
+      <select id="sortMode">
+       <option value="name:asc">名前</option>
+       <option value="date:desc">更新日時</option>
+       <option value="size:desc">サイズ</option>
+       <option value="type:asc">種類</option>
+      </select>
+     </label>
+     <label class="select grid-size-control" id="gridSizeWrap" title="グリッドサイズ">
+      <span class="label-icon">▥</span>
+      <input id="gridSize" type="range" min="110" max="360" step="10" value="220">
+     </label>
+    </div>
+   </div>
+  </section>
+  <section class="panel">
+   <div class="list-header" id="listHeader">
+    <button onclick="setSortFromButton('name'); return false;">名前</button>
+    <button onclick="setSortFromButton('date'); return false;">更新日時</button>
+    <button onclick="setSortFromButton('size'); return false;">サイズ</button>
+    <button onclick="setSortFromButton('type'); return false;">種類</button>
+   </div>
+   <div class="entries" id="entries"></div>
+  </section>
+  <div class="footer">${escapeHtml(footerInfo)}</div>
+  ${cmd && path === '' ? '<br><input placeholder="Enter your command here and press enter" style="float: right; width: 250px" onkeypress="if (event.which === 13) location.href += \'@cmd/\' + this.value;">' : ''}
+ </div>
+ <div class="tasks" id="tasks"></div>
+ <div class="drop-overlay" id="dropOverlay"><strong>ここにファイルやフォルダをドロップしてアップロード</strong></div>
+ <div class="preview-modal" id="previewModal" aria-hidden="true">
+  <div class="preview-dialog">
+   <div class="preview-stage">
+    <button class="preview-nav preview-prev" id="previewPrev" title="前のファイル" aria-label="前のファイル">‹</button>
+    <button class="preview-close" id="previewClose" title="閉じる" aria-label="閉じる">✕</button>
+    <div class="preview-content" id="previewContent"></div>
+    <button class="preview-nav preview-next" id="previewNext" title="次のファイル" aria-label="次のファイル">›</button>
+   </div>
+   <aside class="preview-side">
+    <div class="preview-meta">
+     <div>
+      <h3 id="previewTitle"></h3>
+      <p id="previewType"></p>
+     </div>
+     <div class="preview-counter" id="previewCounter"></div>
+    </div>
+    <div class="preview-actions primary-actions">
+     <button class="preview-button primary" id="previewShare">リンクを共有</button>
+     <button class="preview-button" id="previewOpen">新しいタブで開く</button>
+    </div>
+    <div class="preview-actions secondary">
+     <button class="preview-button" id="previewRename">名前を変更</button>
+     <button class="preview-button" id="previewDelete">削除</button>
+    </div>
+   </aside>
+  </div>
+ </div>
+ <script>
+ "use strict";
+ var entries = ${JSON.stringify(entries).replace(/</g, '\\u003c')};
+ var allowDelete = ${allowDelete ? 'true' : 'false'};
+ var allowRename = ${allowRename && path === '' ? 'true' : 'false'};
+ var noUpload = ${noUpload ? 'true' : 'false'};
+ var uploadCounter = 0;
+ var activeUploads = 0;
+ var queuedReload = false;
+ var currentPreviewIndex = -1;
+ var menuExpanded = false;
+ var menuManuallyExpanded = false;
+ var menuHoverExpanded = false;
+ var menuAutoLockUntil = 0;
+ var pendingUploadRefresh = null;
+ var supportsHoverMenu = false;
+
+ function readSetting(key, fallback) {
+   try {
+     return localStorage.getItem(key) || fallback;
+   } catch (e) {
+     return fallback;
+   }
+ }
+
+ function writeSetting(key, value) {
+   try { localStorage.setItem(key, value); } catch (e) {}
+ }
+
+ function applyMenuState(expanded) {
+   if (menuExpanded === expanded) return;
+   menuExpanded = expanded;
+   var hero = document.querySelector('.hero');
+   hero.classList.toggle('menu-collapsed', !expanded);
+   var toggle = document.getElementById('menuToggle');
+   toggle.textContent = expanded ? '✕' : '☰';
+   toggle.title = expanded ? 'メニューを閉じる' : 'メニューを開く';
+   toggle.setAttribute('aria-label', toggle.title);
+  }
+
+ function syncMenuWithScroll() {
+   if (window.scrollY <= 0) {
+     menuManuallyExpanded = false;
+     menuHoverExpanded = false;
+     menuAutoLockUntil = Date.now() + 180;
+     applyMenuState(true);
+     return;
+   }
+   if (Date.now() < menuAutoLockUntil) return;
+   if (window.scrollY < 56 && menuExpanded) return;
+   if (menuHoverExpanded) return;
+   if (menuManuallyExpanded) return;
+   menuAutoLockUntil = Date.now() + 180;
+   applyMenuState(false);
+  }
+
+ function updateGridSizeControl() {
+   var wrap = document.getElementById('gridSizeWrap');
+   var slider = document.getElementById('gridSize');
+   wrap.classList.remove('disabled');
+   slider.disabled = false;
+  }
+
+ function updateThumbToggleState() {
+   var toggle = document.getElementById('thumbToggle');
+   var label = toggle.closest('.toggle');
+   var isGallery = document.getElementById('viewMode').value === 'gallery';
+   toggle.disabled = isGallery;
+   if (label) label.classList.toggle('disabled', isGallery);
+ }
+
+ function canUseHoverMenu() {
+   return matchMedia('(hover: hover) and (pointer: fine)').matches;
+ }
+
+ function applyTheme(theme) {
+   document.documentElement.dataset.theme = theme === 'auto'
+     ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+     : theme;
+ }
+
+ function formatSize(size, isDir) {
+   if (isDir) return '-';
+   if (!size) return '0B';
+   var e = (Math.log(size) / Math.log(1e3)) | 0;
+   return Math.floor(size / Math.pow(1e3, e)) + ('kMGTPEZY'[e - 1] || '') + 'B';
+ }
+
+ function getIcon(entry) {
+   if (entry.isParent) return '↩';
+   if (entry.isDir) return '📁';
+   if ((entry.typeText || '').indexOf('image/') === 0) return '🖼';
+   if ((entry.typeText || '').indexOf('video/') === 0) return '🎬';
+   if ((entry.typeText || '').indexOf('audio/') === 0) return '🎵';
+   return '📄';
+ }
+
+ function getSortedEntries() {
+   return entries.slice().sort(compareEntries);
+ }
+
+ function getPreviewEntries() {
+   return getSortedEntries().filter(function (entry) {
+     return !entry.isDir && !!entry.previewUrl;
+   });
+ }
+
+ function isPreviewEntry(entry) {
+   return !entry.isDir && !!entry.previewUrl;
+  }
+
+ function folderSizeText(entry) {
+   if (!entry.isDir) return formatSize(entry.size, false);
+   if (entry.isParent) return '-';
+   if (typeof entry.folderSize === 'number') return formatSize(entry.folderSize, false);
+   if (entry.folderSize === 'error') return '計算失敗';
+   return '計算中…';
+  }
+
+ function recalculateFolderSize(entry) {
+   entry.folderSize = 'loading';
+   renderEntries();
+   request(function (msg, status) {
+     if (status !== 200) {
+       entry.folderSize = 'error';
+       renderEntries();
+       return;
+     }
+     try {
+       entry.folderSize = JSON.parse(msg).size;
+     } catch (e) {
+       entry.folderSize = 'error';
+     }
+     renderEntries();
+   }, '@size-refresh/' + encodeURIComponent(entry.name), 'GET');
+ }
+
+ function currentSort() {
+   var value = document.getElementById('sortMode').value.split(':');
+   return { key: value[0], dir: value[1] };
+ }
+
+ function compareEntries(a, b) {
+   if (a.isParent) return -1;
+   if (b.isParent) return 1;
+   if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+   var sort = currentSort();
+   var x = a[sort.key + (sort.key === 'type' ? 'Text' : '')] || a[sort.key];
+   var y = b[sort.key + (sort.key === 'type' ? 'Text' : '')] || b[sort.key];
+   if (sort.key === 'name' || sort.key === 'type') {
+     x = String(x).toLowerCase();
+     y = String(y).toLowerCase();
+   }
+   if (x === y) return a.name.toLowerCase() > b.name.toLowerCase() ? 1 : -1;
+   return x > y ? (sort.dir === 'asc' ? 1 : -1) : (sort.dir === 'asc' ? -1 : 1);
+ }
+
+ function renderEntries() {
+   var container = document.getElementById('entries');
+   var view = document.getElementById('viewMode').value;
+   var showThumbs = document.getElementById('thumbToggle').checked || view === 'gallery';
+   container.style.setProperty('--grid-size', document.getElementById('gridSize').value + 'px');
+   var scale = Math.max(0.56, Math.min(1.22, document.getElementById('gridSize').value / 220));
+   container.style.setProperty('--grid-scale', scale.toFixed(3));
+   container.style.setProperty('--item-scale', scale.toFixed(3));
+   document.getElementById('listHeader').className =
+     (view === 'grid' || view === 'gallery') ? 'list-header hidden-header' : 'list-header';
+   container.dataset.view = view;
+   container.innerHTML = '';
+   getSortedEntries().forEach(function (entry) {
+     var article = document.createElement('article');
+     article.className = 'entry';
+     if (entry.isDir) article.classList.add('is-directory');
+     article.dataset.name = entry.name;
+     var main = document.createElement('div');
+     main.className = 'entry-main';
+     var mainLink = document.createElement('a');
+     mainLink.href = entry.href;
+     mainLink.className = 'entry-link';
+     if (isPreviewEntry(entry)) {
+       mainLink.addEventListener('click', function (ev) {
+         ev.preventDefault();
+         openPreviewByName(entry.name);
+       });
+     }
+     main.appendChild(mainLink);
+     var content = document.createElement('div');
+     content.className = 'entry-main-content';
+     var thumb = document.createElement('div');
+     thumb.className = 'entry-thumb';
+     if (showThumbs && entry.previewUrl && !entry.isDir) {
+       if ((entry.typeText || '').indexOf('video/') === 0) {
+         var video = document.createElement('video');
+         video.src = entry.previewUrl;
+         video.muted = true;
+         video.playsInline = true;
+         thumb.appendChild(video);
+       } else {
+         var img = document.createElement('img');
+         img.src = entry.previewUrl;
+         img.alt = entry.name;
+         img.loading = 'lazy';
+         thumb.appendChild(img);
+       }
+     } else {
+       thumb.textContent = getIcon(entry);
+     }
+     var meta = document.createElement('div');
+     meta.className = 'entry-meta';
+     var topRow = document.createElement('div');
+     topRow.className = 'entry-top';
+     topRow.style.display = 'flex';
+     topRow.style.alignItems = 'center';
+     topRow.style.gap = '10px';
+     var link = document.createElement('span');
+     link.className = 'entry-name';
+     link.textContent = entry.name + (entry.isDir && !entry.isParent ? '/' : '');
+     mainLink.draggable = allowRename && !entry.isDir && !entry.isParent;
+     if (mainLink.draggable) {
+       mainLink.addEventListener('dragstart', function (ev) {
+         ev.dataTransfer.setData('text/plain', entry.name);
+       });
+     }
+     if (allowRename && entry.isDir && !entry.isParent) {
+       mainLink.addEventListener('dragover', function (ev) {
+         ev.preventDefault();
+         ev.dataTransfer.dropEffect = 'move';
+       });
+       mainLink.addEventListener('drop', function (ev) {
+         ev.preventDefault();
+         var source = ev.dataTransfer.getData('text/plain');
+         request(function () { location.reload(); },
+           encodeURIComponent(source) + '@' + encodeURIComponent(entry.name) + '/' + encodeURIComponent(source), 'PATCH');
+       });
+     }
+     topRow.appendChild(link);
+     if (!entry.isParent && (allowDelete || allowRename)) {
+       var actions = document.createElement('div');
+       actions.className = 'entry-actions';
+       if (allowRename) {
+         var renameButton = document.createElement('button');
+         renameButton.className = 'icon-button rename';
+         renameButton.textContent = '✍';
+         renameButton.title = '名前変更';
+         renameButton.onclick = function () {
+           renameEntry(entry, link);
+         };
+         actions.appendChild(renameButton);
+       }
+      if (allowDelete) {
+        var deleteButton = document.createElement('button');
+        deleteButton.className = 'icon-button danger';
+        deleteButton.textContent = '✗';
+        deleteButton.title = '削除';
+         deleteButton.onclick = function () {
+           deleteEntry(entry);
+        };
+        actions.appendChild(deleteButton);
+      }
+      if (entry.isDir && !entry.isParent) {
+        var refreshButton = document.createElement('button');
+        refreshButton.className = 'icon-button';
+        refreshButton.textContent = '⟳';
+        refreshButton.title = 'フォルダ容量を再計算';
+        refreshButton.onclick = function () {
+          recalculateFolderSize(entry);
+        };
+        actions.appendChild(refreshButton);
+      }
+      if (view === 'gallery') main.appendChild(actions);
+      else topRow.appendChild(actions);
+    }
+     meta.appendChild(topRow);
+     var sub = document.createElement('div');
+     sub.className = 'entry-sub';
+     sub.textContent = entry.isDir ? 'フォルダ' : (entry.typeText || 'ファイル');
+     meta.appendChild(sub);
+     content.appendChild(thumb);
+     content.appendChild(meta);
+     main.appendChild(content);
+     article.appendChild(main);
+     if (view !== 'gallery') {
+       ['dateText', 'size', 'typeText'].forEach(function (field, index) {
+         var col = document.createElement('div');
+         col.className = 'entry-col';
+         if (index === 0) col.textContent = entry.dateText || '-';
+         if (index === 1) col.textContent = folderSizeText(entry);
+         if (index === 2) col.textContent = entry.typeText || '-';
+         article.appendChild(col);
+       });
+     }
+     container.appendChild(article);
+   });
+   fetchFolderSizes();
+  }
+
+ function setSortFromButton(key) {
+   var select = document.getElementById('sortMode');
+   var current = currentSort();
+   var nextDir = current.key === key && current.dir === 'asc' ? 'desc' : 'asc';
+   if (key === 'date' || key === 'size') nextDir = current.key === key && current.dir === 'desc' ? 'asc' : 'desc';
+   select.value = key + ':' + nextDir;
+   writeSetting('pad.sort', select.value);
+   renderEntries();
+ }
+
+ function request(callback, url, method, body, onProgress) {
+   var xhr = new XMLHttpRequest();
+   xhr.open(method, url);
+   xhr.onload = function () {
+     if (xhr.readyState === xhr.DONE) {
+       if (xhr.status !== 200) alert(xhr.responseText);
+       callback(xhr.responseText, xhr.status);
+     }
+   };
+   xhr.onerror = function () {
+     alert('通信エラーが発生しました');
+     callback('network-error', 0);
+   };
+   if (xhr.upload && onProgress) xhr.upload.onprogress = onProgress;
+   xhr.withCredentials = true;
+   xhr.send(body);
+  }
+
+ function fetchFolderSizes() {
+   getSortedEntries().filter(function (entry) {
+     return entry.isDir && !entry.isParent && entry.folderSize === null;
+   }).forEach(function (entry) {
+     entry.folderSize = 'loading';
+     request(function (msg, status) {
+       if (status !== 200) {
+         entry.folderSize = 'error';
+         renderEntries();
+         return;
+       }
+       try {
+         entry.folderSize = JSON.parse(msg).size;
+       } catch (e) {
+         entry.folderSize = 'error';
+       }
+       renderEntries();
+     }, '@size/' + encodeURIComponent(entry.name), 'GET');
+   });
+  }
+
+ function setPreviewNavState(items) {
+   document.getElementById('previewPrev').style.display = items.length > 1 ? '' : 'none';
+   document.getElementById('previewNext').style.display = items.length > 1 ? '' : 'none';
+ }
+
+ function renderPreview(entry, index, items) {
+   var content = document.getElementById('previewContent');
+   content.innerHTML = '';
+   if ((entry.typeText || '').indexOf('image/') === 0) {
+     var image = document.createElement('img');
+     image.src = entry.previewUrl;
+     image.alt = entry.name;
+     content.appendChild(image);
+   } else if ((entry.typeText || '').indexOf('video/') === 0) {
+     var video = document.createElement('video');
+     video.src = entry.previewUrl;
+     video.controls = true;
+     video.autoplay = true;
+     content.appendChild(video);
+   } else if ((entry.typeText || '').indexOf('audio/') === 0) {
+     var audio = document.createElement('audio');
+     audio.src = entry.previewUrl;
+     audio.controls = true;
+     audio.autoplay = true;
+     content.appendChild(audio);
+   }
+   document.getElementById('previewTitle').textContent = entry.name;
+   document.getElementById('previewType').textContent = entry.typeText || 'ファイル';
+   document.getElementById('previewCounter').textContent = (index + 1) + ' / ' + items.length;
+   document.getElementById('previewShare').textContent = 'リンクを共有';
+   document.getElementById('previewRename').disabled = !allowRename;
+   document.getElementById('previewDelete').disabled = !allowDelete;
+   setPreviewNavState(items);
+  }
+
+ function openPreviewByName(name) {
+   var items = getPreviewEntries();
+   currentPreviewIndex = items.findIndex(function (entry) { return entry.name === name; });
+   if (currentPreviewIndex === -1) return;
+   renderPreview(items[currentPreviewIndex], currentPreviewIndex, items);
+   document.getElementById('previewModal').classList.add('open');
+   document.getElementById('previewModal').setAttribute('aria-hidden', 'false');
+ }
+
+ function closePreview() {
+   var modal = document.getElementById('previewModal');
+   modal.classList.remove('open');
+   modal.setAttribute('aria-hidden', 'true');
+   document.getElementById('previewContent').innerHTML = '';
+   currentPreviewIndex = -1;
+ }
+
+ function movePreview(step) {
+   var items = getPreviewEntries();
+   if (!items.length || currentPreviewIndex === -1) return;
+   currentPreviewIndex = (currentPreviewIndex + step + items.length) % items.length;
+   renderPreview(items[currentPreviewIndex], currentPreviewIndex, items);
+ }
+
+ function currentPreviewEntry() {
+   var items = getPreviewEntries();
+   if (currentPreviewIndex < 0 || currentPreviewIndex >= items.length) return null;
+   return items[currentPreviewIndex];
+ }
+
+ function createFolder() {
+   var name = prompt('作成するフォルダ名を入力してください:');
+   if (!name) return;
+   request(function () { location.reload(); }, encodeURIComponent(name), 'PUT');
+  }
+
+ function renameEntryTo(entry, to, onDone) {
+   request(function (msg, status) {
+     if (status !== 200) return;
+     entry.name = to;
+     entry.href = encodeURIComponent(to) + (entry.isDir ? '/' : '');
+     entry.previewUrl = entry.previewUrl ? encodeURIComponent(to) : '';
+     renderEntries();
+     if (typeof onDone === 'function') onDone(entry);
+   }, encodeURIComponent(entry.name) + '@' + encodeURIComponent(to), 'PATCH');
+ }
+
+ function renameEntry(entry, link) {
+   var from = entry.name;
+   var overlayLink = link.closest('.entry-main').querySelector('.entry-link');
+   if (overlayLink) overlayLink.style.display = 'none';
+   link.contentEditable = true;
+   link.focus();
+   var selection = window.getSelection();
+   var range = document.createRange();
+   range.selectNodeContents(link);
+   selection.removeAllRanges();
+   selection.addRange(range);
+   link.onkeydown = function (e) {
+     if (e.key === 'Escape') {
+       link.textContent = from + (entry.isDir ? '/' : '');
+       link.blur();
+     }
+     if (e.key !== 'Enter') return;
+     e.preventDefault();
+     var to = link.textContent.replace(/\\\/$/, '');
+     renameEntryTo(entry, to, function () {
+       link.textContent = entry.name + (entry.isDir ? '/' : '');
+     });
+   };
+   link.onblur = function () {
+     link.contentEditable = false;
+     link.textContent = entry.name + (entry.isDir ? '/' : '');
+     if (overlayLink) overlayLink.style.display = '';
+   };
+ }
+
+ function deleteEntry(entry) {
+   var message = entry.isDir
+     ? '「' + entry.name + '」フォルダを中身ごと削除します。よろしいですか？'
+     : '「' + entry.name + '」を削除します。よろしいですか？';
+   if (!confirm(message)) return;
+  request(function (msg, status) {
+     if (status !== 200) return;
+     entries = entries.filter(function (item) { return item.name !== entry.name; });
+     renderEntries();
+     if (currentPreviewEntry() && currentPreviewEntry().name === entry.name) closePreview();
+   }, encodeURIComponent(entry.name), 'DELETE');
+  }
+
+ function noteSubmit(text) {
+   text = text || prompt('ノートの内容を入力してください:');
+   if (!text) return;
+   enqueueUploads([{ file: new Blob([text], { type: 'text/plain' }), path: Date.now() + '.txt' }]);
+ }
+
+ function createTask(label) {
+   var id = 'task-' + (++uploadCounter);
+   var node = document.createElement('div');
+   node.className = 'task';
+   node.id = id;
+   node.innerHTML = '<div class="task-head"><strong></strong><span class="task-status">待機中</span></div><div class="progress"><div class="progress-bar"></div></div>';
+   node.querySelector('strong').textContent = label;
+   document.getElementById('tasks').appendChild(node);
+   return {
+     node: node,
+     setStatus: function (status) { node.querySelector('.task-status').textContent = status; },
+     setProgress: function (value) { node.querySelector('.progress-bar').style.width = value + '%'; }
+   };
+  }
+
+ function scheduleUploadRefresh() {
+   if (!queuedReload || activeUploads > 0) return;
+   if (pendingUploadRefresh) clearTimeout(pendingUploadRefresh);
+   pendingUploadRefresh = setTimeout(function () {
+     location.reload();
+   }, 450);
+  }
+
+ function normalizeUploadItem(item) {
+   var path = item.path || item.webkitRelativePath || item.name || '';
+   if (!path || path.split('.')[0] === 'image') {
+     var extension = (item.file && item.file.type || '').split('/')[1] || 'bin';
+     path = Date.now() + '.' + extension;
+   }
+   return { file: item.file || item, path: path.replace(/^\\\/+/, '') };
+ }
+
+ function uploadOne(item, done) {
+   var normalized = normalizeUploadItem(item);
+   var task = createTask(normalized.path);
+   var formData = new FormData();
+   formData.append('blob', normalized.file);
+   if (pendingUploadRefresh) {
+     clearTimeout(pendingUploadRefresh);
+     pendingUploadRefresh = null;
+   }
+   activeUploads += 1;
+   task.setStatus('アップロード中');
+   request(function (msg, status) {
+     activeUploads -= 1;
+     if (status === 200) {
+       queuedReload = true;
+       task.setProgress(100);
+       task.setStatus('完了');
+       scheduleUploadRefresh();
+     } else {
+       task.setStatus('失敗');
+     }
+     done();
+   }, normalized.path.split('/').map(encodeURIComponent).join('/'), 'POST', formData, function (e) {
+     if (!e.lengthComputable) return;
+     task.setProgress(Math.max(4, e.loaded / e.total * 100));
+     task.setStatus(Math.round(e.loaded / e.total * 100) + '%');
+   });
+ }
+
+ function enqueueUploads(items) {
+   var queue = items.map(normalizeUploadItem);
+   if (!queue.length) return;
+   (function next() {
+     var current = queue.shift();
+     if (!current) {
+       scheduleUploadRefresh();
+       return;
+     }
+     uploadOne(current, next);
+   }());
+ }
+
+ function traverseEntry(entry, prefix) {
+   return new Promise(function (resolve) {
+     if (entry.isFile) {
+       entry.file(function (file) {
+         resolve([{ file: file, path: prefix + file.name }]);
+       });
+       return;
+     }
+     if (!entry.isDirectory) {
+       resolve([]);
+       return;
+     }
+     var reader = entry.createReader();
+     var output = [];
+     function readBatch() {
+       reader.readEntries(function (results) {
+         if (!results.length) {
+           resolve(Promise.all(output).then(function (parts) {
+             return parts.reduce(function (all, part) { return all.concat(part); }, []);
+           }));
+           return;
+         }
+         results.forEach(function (child) {
+           output.push(traverseEntry(child, prefix + entry.name + '/'));
+         });
+         readBatch();
+       });
+     }
+     readBatch();
+   }).then(function (result) { return result; });
+ }
+
+ function filesFromTransfer(dataTransfer) {
+   var items = Array.prototype.slice.call(dataTransfer.items || []);
+   if (!items.length || !items.some(function (item) { return item.webkitGetAsEntry; })) {
+     return Promise.resolve(Array.prototype.slice.call(dataTransfer.files || []).map(function (file) {
+       return { file: file, path: file.webkitRelativePath || file.name };
+     }));
+   }
+   return Promise.all(items.map(function (item) {
+     if (item.kind === 'string') {
+       return new Promise(function (resolve) {
+         item.getAsString(function (text) {
+           noteSubmit(text);
+           resolve([]);
+         });
+       });
+     }
+     var entry = item.webkitGetAsEntry && item.webkitGetAsEntry();
+     return entry ? traverseEntry(entry, '') : [];
+   })).then(function (parts) {
+     return parts.reduce(function (all, part) { return all.concat(part); }, []);
+   });
+ }
+
+ function handleDataTransfer(dataTransfer) {
+   if (noUpload) return;
+   filesFromTransfer(dataTransfer).then(function (items) {
+     if (items.length) enqueueUploads(items);
+   });
+ }
+
+ var dragDepth = 0;
+ document.addEventListener('dragenter', function (e) {
+   if (noUpload) return;
+   e.preventDefault();
+   dragDepth += 1;
+   document.getElementById('dropOverlay').classList.add('active');
+ }, false);
+ document.addEventListener('dragover', function (e) {
+   if (noUpload) return;
+   e.preventDefault();
+ }, false);
+ document.addEventListener('dragleave', function (e) {
+   if (noUpload) return;
+   e.preventDefault();
+   dragDepth = Math.max(0, dragDepth - 1);
+   if (!dragDepth) document.getElementById('dropOverlay').classList.remove('active');
+ }, false);
+ document.addEventListener('drop', function (e) {
+   if (noUpload) return;
+   e.preventDefault();
+   dragDepth = 0;
+   document.getElementById('dropOverlay').classList.remove('active');
+   handleDataTransfer(e.dataTransfer);
+ }, false);
+ document.body.addEventListener('paste', function (e) {
+   if (e.target.nodeName !== 'INPUT') handleDataTransfer(e.clipboardData);
+ });
+
+ if (!noUpload) {
+   document.getElementById('fileInput').addEventListener('change', function () {
+     enqueueUploads(Array.prototype.slice.call(this.files).map(function (file) {
+       return { file: file, path: file.name };
+     }));
+     this.value = '';
+   });
+   document.getElementById('folderInput').addEventListener('change', function () {
+     enqueueUploads(Array.prototype.slice.call(this.files).map(function (file) {
+       return { file: file, path: file.webkitRelativePath || file.name };
+     }));
+     this.value = '';
+   });
+ }
+
+ var savedView = readSetting('pad.view', 'list');
+ if (savedView === 'comfortable') savedView = 'list';
+ document.getElementById('viewMode').value = savedView;
+ document.getElementById('thumbToggle').checked = readSetting('pad.thumbs', 'off') === 'on';
+ document.getElementById('themeMode').value = readSetting('pad.theme', 'auto');
+ document.getElementById('sortMode').value = readSetting('pad.sort', 'name:asc');
+ document.getElementById('gridSize').value = readSetting('pad.gridSize', '220');
+ applyTheme(document.getElementById('themeMode').value);
+ supportsHoverMenu = canUseHoverMenu();
+ applyMenuState(window.scrollY <= 2);
+ updateGridSizeControl();
+ updateThumbToggleState();
+
+ ['viewMode', 'sortMode', 'themeMode'].forEach(function (id) {
+   document.getElementById(id).addEventListener('change', function () {
+     writeSetting('pad.' + id.replace('Mode', '').toLowerCase(), this.value);
+     if (id === 'themeMode') {
+       writeSetting('pad.theme', this.value);
+       applyTheme(this.value);
+     }
+     if (id === 'sortMode') writeSetting('pad.sort', this.value);
+     if (id === 'viewMode') writeSetting('pad.view', this.value);
+     if (id === 'viewMode') {
+       updateGridSizeControl();
+       updateThumbToggleState();
+       if (this.value === 'gallery' && !document.getElementById('thumbToggle').checked) {
+         document.getElementById('thumbToggle').checked = true;
+         writeSetting('pad.thumbs', 'on');
+       }
+     }
+     renderEntries();
+   });
+  });
+ document.getElementById('menuToggle').addEventListener('click', function () {
+   if (window.scrollY > 2) menuManuallyExpanded = !menuExpanded;
+   else menuManuallyExpanded = false;
+   applyMenuState(!menuExpanded);
+  });
+ document.querySelector('.hero').addEventListener('click', function (event) {
+   if (!this.classList.contains('menu-collapsed')) return;
+   if (supportsHoverMenu) return;
+   if (event.target.id === 'menuToggle') return;
+   event.preventDefault();
+   menuManuallyExpanded = window.scrollY > 2;
+   applyMenuState(true);
+ });
+ document.querySelector('.hero').addEventListener('mouseenter', function () {
+   if (!supportsHoverMenu) return;
+   if (!this.classList.contains('menu-collapsed')) return;
+   menuHoverExpanded = true;
+   applyMenuState(true);
+ });
+ document.querySelector('.hero').addEventListener('mouseleave', function () {
+   if (!supportsHoverMenu) return;
+   menuHoverExpanded = false;
+   if (window.scrollY <= 2) return;
+   if (menuManuallyExpanded) return;
+   applyMenuState(false);
+  });
+ document.getElementById('thumbToggle').addEventListener('change', function () {
+   writeSetting('pad.thumbs', this.checked ? 'on' : 'off');
+   renderEntries();
+ });
+ document.getElementById('gridSize').addEventListener('input', function () {
+   writeSetting('pad.gridSize', this.value);
+   renderEntries();
+ });
+ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+   if (document.getElementById('themeMode').value === 'auto') applyTheme('auto');
+  });
+ matchMedia('(hover: hover) and (pointer: fine)').addEventListener('change', function () {
+   supportsHoverMenu = canUseHoverMenu();
+ });
+ document.getElementById('previewClose').addEventListener('click', closePreview);
+ document.getElementById('previewPrev').addEventListener('click', function () { movePreview(-1); });
+ document.getElementById('previewNext').addEventListener('click', function () { movePreview(1); });
+ document.getElementById('previewModal').addEventListener('click', function (event) {
+   if (event.target.id === 'previewModal') closePreview();
+ });
+ document.getElementById('previewOpen').addEventListener('click', function () {
+   var entry = currentPreviewEntry();
+   if (!entry) return;
+   window.open(entry.href, '_blank', 'noopener');
+ });
+ document.getElementById('previewShare').addEventListener('click', function () {
+   var entry = currentPreviewEntry();
+   if (!entry) return;
+   var url = new URL(entry.href, window.location.href).toString();
+   if (navigator.clipboard && navigator.clipboard.writeText) {
+     navigator.clipboard.writeText(url).then(function () {
+       document.getElementById('previewShare').textContent = 'コピーしました';
+       setTimeout(function () {
+         document.getElementById('previewShare').textContent = 'リンクを共有';
+       }, 1400);
+     });
+   } else {
+     prompt('リンクをコピーしてください:', url);
+   }
+  });
+  document.getElementById('previewRename').addEventListener('click', function () {
+   var entry = currentPreviewEntry();
+   if (!entry || !allowRename) return;
+   var to = prompt('新しい名前を入力してください:', entry.name);
+   if (!to || to === entry.name) return;
+   renameEntryTo(entry, to, function () {
+     openPreviewByName(to);
+   });
+  });
+  document.getElementById('previewDelete').addEventListener('click', function () {
+   var entry = currentPreviewEntry();
+   if (!entry || !allowDelete) return;
+   var items = getPreviewEntries();
+   var currentName = entry.name;
+   var nextIndex = items.length > 1 ? (currentPreviewIndex + 1) % items.length : -1;
+   var nextName = nextIndex >= 0 ? items[nextIndex].name : null;
+   var message = '「' + currentName + '」を削除します。よろしいですか？';
+   if (!confirm(message)) return;
+   request(function (msg, status) {
+     if (status !== 200) return;
+     entries = entries.filter(function (item) { return item.name !== currentName; });
+     renderEntries();
+     if (nextName && nextName !== currentName) openPreviewByName(nextName);
+     else closePreview();
+   }, encodeURIComponent(currentName), 'DELETE');
+  });
+ document.addEventListener('keydown', function (event) {
+   if (!document.getElementById('previewModal').classList.contains('open')) return;
+   if (event.key === 'Escape') closePreview();
+   if (event.key === 'ArrowLeft') movePreview(-1);
+   if (event.key === 'ArrowRight') movePreview(1);
+  });
+ window.addEventListener('scroll', syncMenuWithScroll, { passive: true });
+ syncMenuWithScroll();
+ renderEntries();
+ </script>
+</body>
+</html>`);
     });
   });
 });
