@@ -195,6 +195,10 @@ function isPreviewable(mimeType) {
   return /^(image|video|audio)\//.test(mimeType || '');
 }
 
+function encodePathSegments(target) {
+  return target.split('/').map(encodeURIComponent).join('/');
+}
+
 function getFolderSizeCachePath(target) {
   return pathLib.join(target, folderSizeCacheFile);
 }
@@ -260,6 +264,64 @@ function calculateDirectorySize(target, callback) {
   });
 }
 
+function searchDirectory(target, query, callback) {
+  var needle = (query || '').toLowerCase();
+  var maxResults = 500;
+  var results = [];
+
+  function walk(currentPath, relativePath, done) {
+    fs.readdir(currentPath, function (err, items) {
+      if (err) return done(err);
+      items = items.filter(function (item) { return item !== folderSizeCacheFile; });
+      var pending = items.length;
+      if (!pending || results.length >= maxResults) return done(null);
+      items.forEach(function (item) {
+        var itemRelativePath = relativePath ? relativePath + '/' + item : item;
+        var itemPath = pathLib.join(currentPath, item);
+        fs.stat(itemPath, function (statErr, stats) {
+          if (statErr) {
+            if (--pending === 0) done(null);
+            return;
+          }
+          var ext = item.replace(/^.*\.(.*)$/, "$1");
+          var typeText = stats.isDirectory() ? 'Directory' : (contentTypes[ext.toLowerCase()] || '');
+          var matches = !needle ||
+            item.toLowerCase().indexOf(needle) !== -1 ||
+            itemRelativePath.toLowerCase().indexOf(needle) !== -1;
+          if (matches && results.length < maxResults) {
+            results.push({
+              name: item,
+              requestPath: itemRelativePath,
+              href: encodePathSegments(itemRelativePath) + (stats.isDirectory() ? '/' : ''),
+              size: stats.size || 0,
+              folderSize: null,
+              date: +(new Date(stats.mtime)) || 0,
+              dateText: stats.mtime ? new Date(stats.mtime).toISOString().replace('T', ' ').split('.')[0] : '',
+              isDir: stats.isDirectory(),
+              typeText: typeText,
+              previewUrl: !stats.isDirectory() && isPreviewable(typeText) ? encodePathSegments(itemRelativePath) : '',
+              isParent: false,
+              displayPath: itemRelativePath
+            });
+          }
+          if (!stats.isDirectory() || results.length >= maxResults) {
+            if (--pending === 0) done(null);
+            return;
+          }
+          walk(itemPath, itemRelativePath, function (walkErr) {
+            if (walkErr) return done(walkErr);
+            if (--pending === 0) done(null);
+          });
+        });
+      });
+    });
+  }
+
+  walk(target, '', function (err) {
+    callback(err, results);
+  });
+}
+
 var lastActivityTimestamp = Date.now();
 if (timeout !== -1) {
   setInterval(function () {
@@ -295,7 +357,9 @@ var server = (https ? function (requestListener) {
     return res.end('HTTP Error 405 Method Not Allowed');
   }
 
-  var path = req.url.split('?')[0];
+  var parsedUrl = url.parse(req.url, true);
+  var path = parsedUrl.pathname || req.url.split('?')[0];
+  var query = parsedUrl.query || {};
   try {
     path = decodeURI(path);
   } catch (e) {
@@ -357,6 +421,37 @@ var server = (https ? function (requestListener) {
             return res.end(JSON.stringify({ size: size, cached: false }));
           });
         });
+      });
+    });
+  }
+  if (path === '/@search' || /\/@search$/.test(path)) {
+    var searchBasePath = path.replace(/\/@search$/, '/');
+    searchBasePath = searchBasePath.replace(/^[\/\\]+/, '').replace(/(^|[\/\\])\.\.(?=[\/\\]|$)/g, '');
+    targetPath = pathLib.resolve(cwd, searchBasePath);
+    try {
+      if (!followOutsideLinks && !isRequestPathAllowed(targetPath, true)) {
+        res.writeHead(404);
+        return res.end('HTTP Error 404 File not found, invalid path');
+      }
+    } catch (e) {
+      res.writeHead(404);
+      return res.end('HTTP Error 404 File not found, error');
+    }
+    return fs.stat(targetPath, function (err, stats) {
+      if (err || !stats.isDirectory()) {
+        res.writeHead(404);
+        return res.end('HTTP Error 404 Directory not found');
+      }
+      return searchDirectory(targetPath, String(query.q || ''), function (searchErr, results) {
+        if (searchErr) {
+          res.writeHead(500);
+          return res.end('HTTP Error 500 Failed to search files');
+        }
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Access-Control-Allow-Origin': '*'
+        });
+        return res.end(JSON.stringify({ entries: results }));
       });
     });
   }
@@ -595,14 +690,15 @@ var server = (https ? function (requestListener) {
         var typeText = fileStats.isDirectory() ? 'Directory' : (contentTypes[ext.toLowerCase()] || '');
         return {
           name: x.toString(),
-          href: encodeURIComponent(x) + (fileStats.isDirectory() ? '/' : ''),
+          requestPath: x.toString(),
+          href: encodePathSegments(x.toString()) + (fileStats.isDirectory() ? '/' : ''),
           size: fileStats.size || 0,
           folderSize: null,
           date: +(new Date(fileStats.mtime)) || 0,
           dateText: fileStats.mtime ? new Date(fileStats.mtime).toISOString().replace('T', ' ').split('.')[0] : '',
           isDir: fileStats.isDirectory(),
           typeText: typeText,
-          previewUrl: !fileStats.isDirectory() && isPreviewable(typeText) ? encodeURIComponent(x) : '',
+          previewUrl: !fileStats.isDirectory() && isPreviewable(typeText) ? encodePathSegments(x.toString()) : '',
           isParent: false
         };
       });
@@ -888,6 +984,58 @@ var server = (https ? function (requestListener) {
     height: 34px;
     box-sizing: border-box;
   }
+  .toolbar-search {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto auto;
+    gap: 8px;
+    align-items: center;
+  }
+  .search-field {
+    min-width: 0;
+    min-height: 34px;
+    padding: 0 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--panel-strong);
+    color: var(--muted);
+  }
+  .search-field .label-icon {
+    line-height: 1;
+  }
+  .search-field input {
+    flex: 1 1 auto;
+    min-width: 0;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+  }
+  .search-field input::placeholder {
+    color: var(--muted);
+  }
+  .toolbar-search .button {
+    justify-content: center;
+  }
+  .search-status {
+    grid-column: 1 / -1;
+    min-height: 18px;
+    color: var(--muted);
+    font-size: 0.8rem;
+  }
+  .hero.classic-hero .search-field {
+    min-height: 30px;
+    border-radius: 0;
+    background: transparent;
+    font-family: monospace;
+  }
+  .hero.classic-hero .search-status {
+    font-family: monospace;
+  }
   .grid-size-control {
     display: inline-flex;
     align-items: center;
@@ -952,6 +1100,14 @@ var server = (https ? function (requestListener) {
     all: unset;
     cursor: pointer;
   }
+  .search-info {
+    padding: 10px 18px 0;
+    color: var(--muted);
+    font-size: 0.82rem;
+  }
+  .search-info:empty {
+    display: none;
+  }
   .list-header.classic-header {
     padding: 10px 12px 4px;
     color: var(--text);
@@ -961,6 +1117,11 @@ var server = (https ? function (requestListener) {
   .list-header.classic-header button:focus {
     color: #c0392b;
     text-decoration: underline;
+  }
+  .panel.classic-panel .search-info {
+    padding: 6px 12px 0;
+    font: 90% monospace;
+    color: var(--text);
   }
   .entries {
     display: grid;
@@ -1335,6 +1496,12 @@ var server = (https ? function (requestListener) {
   .icon-button.danger { color: var(--danger); }
   .icon-button.rename { color: var(--accent); }
   .hidden-header { display: none; }
+  .empty-state {
+    padding: 28px 12px 32px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.92rem;
+  }
   .tasks {
     position: fixed;
     right: 18px;
@@ -1564,11 +1731,17 @@ var server = (https ? function (requestListener) {
     .toolbar-controls {
       justify-content: flex-start;
     }
+    .toolbar-search {
+      grid-template-columns: 1fr 1fr;
+    }
     .button, .toolbar label.select, .toggle, select {
       min-height: 40px;
     }
     .toolbar-controls > * {
       height: 40px;
+    }
+    .search-field {
+      min-height: 40px;
     }
     .menu-toggle {
       width: 40px;
@@ -1637,9 +1810,17 @@ var server = (https ? function (requestListener) {
       flex-wrap: wrap;
       width: 100%;
     }
+    .toolbar-search {
+      grid-template-columns: 1fr;
+    }
     .toolbar-controls label.select {
       flex: 1 1 calc(50% - 4px);
       min-width: 0;
+    }
+    .toolbar-search .button,
+    .search-field {
+      width: 100%;
+      min-height: 40px;
     }
     .grid-size-control {
       flex: 1 1 100%;
@@ -1736,7 +1917,7 @@ var server = (https ? function (requestListener) {
      ${noUpload ? '' : '<button class="button icon-action" title="フォルダを追加" aria-label="フォルダを追加" onclick="document.getElementById(\'folderInput\').click(); return false;">📁</button><input id="folderInput" type="file" webkitdirectory directory multiple hidden>'}
      ${noUpload ? '' : '<button class="button icon-action" title="新しいフォルダ" aria-label="新しいフォルダ" onclick="createFolder(); return false;">＋</button><button class="button icon-action" title="ノート作成" aria-label="ノート作成" onclick="noteSubmit(); return false;">✎</button>'}
     </div>
-    <div class="toolbar-group toolbar-controls">
+   <div class="toolbar-group toolbar-controls">
      <label class="select compact-select" title="表示">
       <span class="label-icon">☰</span>
       <select id="viewMode">
@@ -1770,6 +1951,19 @@ var server = (https ? function (requestListener) {
       <input id="gridSize" type="range" min="110" max="360" step="10" value="220">
      </label>
     </div>
+    <div class="toolbar-group toolbar-search">
+     <label class="search-field" title="現在の一覧を絞り込み">
+      <span class="label-icon">⌕</span>
+      <input id="filterInput" type="search" placeholder="この一覧を絞り込み">
+     </label>
+     <label class="search-field" title="このフォルダ配下を検索">
+      <span class="label-icon">↳</span>
+      <input id="searchInput" type="search" placeholder="配下を検索">
+     </label>
+     <button class="button" id="searchButton" type="button">検索</button>
+     <button class="button" id="searchClear" type="button">解除</button>
+     <div class="search-status" id="searchStatus"></div>
+    </div>
    </div>
   </section>
   <section class="panel">
@@ -1779,6 +1973,7 @@ var server = (https ? function (requestListener) {
     <button onclick="setSortFromButton('size'); return false;">サイズ</button>
     <button onclick="setSortFromButton('type'); return false;">種類</button>
    </div>
+   <div class="search-info" id="searchInfo"></div>
    <div class="entries" id="entries"></div>
   </section>
   <div class="footer">${escapeHtml(footerInfo)}</div>
@@ -1829,6 +2024,11 @@ var server = (https ? function (requestListener) {
  var menuAutoLockUntil = 0;
  var pendingUploadRefresh = null;
  var supportsHoverMenu = false;
+ var activeSearchResults = null;
+ var activeSearchTerm = '';
+ var filterText = '';
+ var searchRequestToken = 0;
+ var searchInProgress = false;
 
  function readSetting(key, fallback) {
    try {
@@ -1908,11 +2108,34 @@ var server = (https ? function (requestListener) {
    if ((entry.typeText || '').indexOf('video/') === 0) return '🎬';
    if ((entry.typeText || '').indexOf('audio/') === 0) return '🎵';
    return '📄';
+  }
+
+ function entryRequestPath(entry) {
+   return entry.requestPath || entry.name;
+ }
+
+ function activeEntriesSource() {
+   return activeSearchResults || entries;
+ }
+
+ function matchesFilter(entry) {
+   if (!filterText) return true;
+   if (entry.isParent) return true;
+   var haystack = [
+     entry.name || '',
+     entry.displayPath || '',
+     entry.typeText || ''
+   ].join('\\n').toLowerCase();
+   return haystack.indexOf(filterText) !== -1;
+ }
+
+ function visibleEntries() {
+   return activeEntriesSource().filter(matchesFilter);
  }
 
  function getSortedEntries() {
-   return entries.slice().sort(compareEntries);
- }
+   return visibleEntries().slice().sort(compareEntries);
+  }
 
  function getPreviewEntries() {
    return getSortedEntries().filter(function (entry) {
@@ -1947,7 +2170,7 @@ var server = (https ? function (requestListener) {
        entry.folderSize = 'error';
      }
      renderEntries();
-   }, '@size-refresh/' + encodeURIComponent(entry.name), 'GET');
+   }, '@size-refresh/' + entryRequestPath(entry).split('/').map(encodeURIComponent).join('/'), 'GET');
  }
 
  function currentSort() {
@@ -1970,6 +2193,76 @@ var server = (https ? function (requestListener) {
    return x > y ? (sort.dir === 'asc' ? 1 : -1) : (sort.dir === 'asc' ? -1 : 1);
  }
 
+ function updateSearchUi(resultCount) {
+   var searchStatus = document.getElementById('searchStatus');
+   var searchInfo = document.getElementById('searchInfo');
+   var clearButton = document.getElementById('searchClear');
+   var searchButton = document.getElementById('searchButton');
+   var parts = [];
+   if (filterText) parts.push('絞り込み中');
+   if (activeSearchTerm) parts.push('検索: ' + activeSearchTerm);
+   if (searchInProgress) {
+     searchStatus.textContent = '検索中…';
+     searchInfo.textContent = activeSearchTerm ? '「' + activeSearchTerm + '」を検索中…' : '検索中…';
+     searchButton.disabled = true;
+   } else {
+     searchStatus.textContent = parts.join(' / ');
+     if (activeSearchTerm) {
+       searchInfo.textContent = '検索結果: ' + resultCount + ' 件';
+     } else if (filterText) {
+       searchInfo.textContent = '絞り込み結果: ' + resultCount + ' 件';
+     } else {
+       searchInfo.textContent = '';
+     }
+     searchButton.disabled = false;
+   }
+   clearButton.style.display = (activeSearchTerm || filterText || searchInProgress) ? '' : 'none';
+ }
+
+ function runRecursiveSearch() {
+   var input = document.getElementById('searchInput');
+   var term = input.value.replace(/^\\s+|\\s+$/g, '');
+   var token = ++searchRequestToken;
+   if (!term) {
+     activeSearchTerm = '';
+     activeSearchResults = null;
+     searchInProgress = false;
+     renderEntries();
+     return;
+   }
+   activeSearchTerm = term;
+   searchInProgress = true;
+   updateSearchUi(getSortedEntries().length);
+   request(function (msg, status) {
+     if (token !== searchRequestToken) return;
+     searchInProgress = false;
+     if (status !== 200) {
+       activeSearchResults = [];
+       renderEntries();
+       return;
+     }
+     try {
+       activeSearchResults = JSON.parse(msg).entries || [];
+     } catch (e) {
+       activeSearchResults = [];
+     }
+     closePreview();
+     renderEntries();
+   }, '@search?q=' + encodeURIComponent(term), 'GET');
+ }
+
+ function clearSearchState() {
+   document.getElementById('filterInput').value = '';
+   document.getElementById('searchInput').value = '';
+   filterText = '';
+   activeSearchTerm = '';
+   activeSearchResults = null;
+   searchInProgress = false;
+   searchRequestToken += 1;
+   closePreview();
+   renderEntries();
+ }
+
  function renderEntries() {
    var container = document.getElementById('entries');
    var hero = document.querySelector('.hero');
@@ -1977,6 +2270,7 @@ var server = (https ? function (requestListener) {
    var listHeader = document.getElementById('listHeader');
    var view = document.getElementById('viewMode').value;
    var showThumbs = document.getElementById('thumbToggle').checked || view === 'gallery';
+   var sortedEntries = getSortedEntries();
    container.style.setProperty('--grid-size', document.getElementById('gridSize').value + 'px');
    var scale = Math.max(0.56, Math.min(1.22, document.getElementById('gridSize').value / 220));
    container.style.setProperty('--grid-scale', scale.toFixed(3));
@@ -1989,7 +2283,15 @@ var server = (https ? function (requestListener) {
    panel.classList.toggle('classic-panel', view === 'classic');
    container.dataset.view = view;
    container.innerHTML = '';
-   getSortedEntries().forEach(function (entry) {
+   if (!sortedEntries.length) {
+     var empty = document.createElement('div');
+     empty.className = 'empty-state';
+     empty.textContent = activeSearchTerm ? '検索結果がありません' : '該当するアイテムがありません';
+     container.appendChild(empty);
+     updateSearchUi(0);
+     return;
+   }
+   sortedEntries.forEach(function (entry) {
      var article = document.createElement('article');
      article.className = 'entry';
      if (entry.isDir) article.classList.add('is-directory');
@@ -2002,7 +2304,7 @@ var server = (https ? function (requestListener) {
      if (isPreviewEntry(entry)) {
        mainLink.addEventListener('click', function (ev) {
          ev.preventDefault();
-         openPreviewByName(entry.name);
+         openPreviewByPath(entryRequestPath(entry));
        });
      }
      main.appendChild(mainLink);
@@ -2095,7 +2397,9 @@ var server = (https ? function (requestListener) {
      meta.appendChild(topRow);
      var sub = document.createElement('div');
      sub.className = 'entry-sub';
-     sub.textContent = entry.isDir ? 'フォルダ' : (entry.typeText || 'ファイル');
+     sub.textContent = entry.displayPath
+       ? entry.displayPath + (entry.isDir ? '/' : '')
+       : (entry.isDir ? 'フォルダ' : (entry.typeText || 'ファイル'));
      meta.appendChild(sub);
      content.appendChild(thumb);
      content.appendChild(meta);
@@ -2113,7 +2417,8 @@ var server = (https ? function (requestListener) {
      }
      container.appendChild(article);
    });
-   fetchFolderSizes();
+   updateSearchUi(sortedEntries.length);
+   if (!activeSearchTerm) fetchFolderSizes();
   }
 
  function setSortFromButton(key) {
@@ -2161,7 +2466,7 @@ var server = (https ? function (requestListener) {
          entry.folderSize = 'error';
        }
        renderEntries();
-     }, '@size/' + encodeURIComponent(entry.name), 'GET');
+     }, '@size/' + entryRequestPath(entry).split('/').map(encodeURIComponent).join('/'), 'GET');
    });
   }
 
@@ -2200,9 +2505,11 @@ var server = (https ? function (requestListener) {
    setPreviewNavState(items);
   }
 
- function openPreviewByName(name) {
+ function openPreviewByPath(requestPath) {
    var items = getPreviewEntries();
-   currentPreviewIndex = items.findIndex(function (entry) { return entry.name === name; });
+   currentPreviewIndex = items.findIndex(function (entry) {
+     return entryRequestPath(entry) === requestPath;
+   });
    if (currentPreviewIndex === -1) return;
    renderPreview(items[currentPreviewIndex], currentPreviewIndex, items);
    document.getElementById('previewModal').classList.add('open');
@@ -2237,14 +2544,20 @@ var server = (https ? function (requestListener) {
   }
 
  function renameEntryTo(entry, to, onDone) {
+   var fromPath = entryRequestPath(entry);
+   var pathParts = fromPath.split('/');
+   pathParts[pathParts.length - 1] = to;
+   var toPath = pathParts.join('/');
    request(function (msg, status) {
      if (status !== 200) return;
      entry.name = to;
-     entry.href = encodeURIComponent(to) + (entry.isDir ? '/' : '');
-     entry.previewUrl = entry.previewUrl ? encodeURIComponent(to) : '';
+     entry.requestPath = toPath;
+     entry.displayPath = entry.displayPath ? toPath : '';
+     entry.href = toPath.split('/').map(encodeURIComponent).join('/') + (entry.isDir ? '/' : '');
+     entry.previewUrl = entry.previewUrl ? toPath.split('/').map(encodeURIComponent).join('/') : '';
      renderEntries();
      if (typeof onDone === 'function') onDone(entry);
-   }, encodeURIComponent(entry.name) + '@' + encodeURIComponent(to), 'PATCH');
+   }, fromPath.split('/').map(encodeURIComponent).join('/') + '@' + toPath.split('/').map(encodeURIComponent).join('/'), 'PATCH');
  }
 
  function renameEntry(entry, link) {
@@ -2281,13 +2594,18 @@ var server = (https ? function (requestListener) {
    var message = entry.isDir
      ? '「' + entry.name + '」フォルダを中身ごと削除します。よろしいですか？'
      : '「' + entry.name + '」を削除します。よろしいですか？';
-   if (!confirm(message)) return;
+  if (!confirm(message)) return;
   request(function (msg, status) {
      if (status !== 200) return;
-     entries = entries.filter(function (item) { return item.name !== entry.name; });
+     entries = entries.filter(function (item) { return entryRequestPath(item) !== entryRequestPath(entry); });
+     if (activeSearchResults) {
+       activeSearchResults = activeSearchResults.filter(function (item) {
+         return entryRequestPath(item) !== entryRequestPath(entry);
+       });
+     }
      renderEntries();
-     if (currentPreviewEntry() && currentPreviewEntry().name === entry.name) closePreview();
-   }, encodeURIComponent(entry.name), 'DELETE');
+     if (currentPreviewEntry() && entryRequestPath(currentPreviewEntry()) === entryRequestPath(entry)) closePreview();
+   }, entryRequestPath(entry).split('/').map(encodeURIComponent).join('/'), 'DELETE');
   }
 
  function noteSubmit(text) {
@@ -2475,6 +2793,18 @@ var server = (https ? function (requestListener) {
    });
  }
 
+ document.getElementById('filterInput').addEventListener('input', function () {
+   filterText = this.value.toLowerCase().replace(/^\\s+|\\s+$/g, '');
+   renderEntries();
+ });
+ document.getElementById('searchInput').addEventListener('keydown', function (event) {
+   if (event.key !== 'Enter') return;
+   event.preventDefault();
+   runRecursiveSearch();
+ });
+ document.getElementById('searchButton').addEventListener('click', runRecursiveSearch);
+ document.getElementById('searchClear').addEventListener('click', clearSearchState);
+
  var savedView = readSetting('pad.view', 'list');
  if (savedView === 'comfortable') savedView = 'list';
  document.getElementById('viewMode').value = savedView;
@@ -2577,28 +2907,34 @@ var server = (https ? function (requestListener) {
   document.getElementById('previewRename').addEventListener('click', function () {
    var entry = currentPreviewEntry();
    if (!entry || !allowRename) return;
-   var to = prompt('新しい名前を入力してください:', entry.name);
-   if (!to || to === entry.name) return;
-   renameEntryTo(entry, to, function () {
-     openPreviewByName(to);
+  var to = prompt('新しい名前を入力してください:', entry.name);
+  if (!to || to === entry.name) return;
+  renameEntryTo(entry, to, function () {
+     openPreviewByPath(entryRequestPath(entry));
    });
   });
   document.getElementById('previewDelete').addEventListener('click', function () {
    var entry = currentPreviewEntry();
    if (!entry || !allowDelete) return;
    var items = getPreviewEntries();
+   var currentPath = entryRequestPath(entry);
    var currentName = entry.name;
    var nextIndex = items.length > 1 ? (currentPreviewIndex + 1) % items.length : -1;
-   var nextName = nextIndex >= 0 ? items[nextIndex].name : null;
+   var nextPath = nextIndex >= 0 ? entryRequestPath(items[nextIndex]) : null;
    var message = '「' + currentName + '」を削除します。よろしいですか？';
    if (!confirm(message)) return;
    request(function (msg, status) {
      if (status !== 200) return;
-     entries = entries.filter(function (item) { return item.name !== currentName; });
+     entries = entries.filter(function (item) { return entryRequestPath(item) !== currentPath; });
+     if (activeSearchResults) {
+       activeSearchResults = activeSearchResults.filter(function (item) {
+         return entryRequestPath(item) !== currentPath;
+       });
+     }
      renderEntries();
-     if (nextName && nextName !== currentName) openPreviewByName(nextName);
+     if (nextPath && nextPath !== currentPath) openPreviewByPath(nextPath);
      else closePreview();
-   }, encodeURIComponent(currentName), 'DELETE');
+   }, currentPath.split('/').map(encodeURIComponent).join('/'), 'DELETE');
   });
  document.addEventListener('keydown', function (event) {
    if (!document.getElementById('previewModal').classList.contains('open')) return;
