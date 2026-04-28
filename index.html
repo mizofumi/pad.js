@@ -683,6 +683,13 @@ var server = (https ? function (requestListener) {
     z-index: 40;
     transition: padding 160ms ease, width 160ms ease, max-width 160ms ease, box-shadow 160ms ease;
   }
+  .hero.classic-hero {
+    border-radius: 0;
+    box-shadow: none;
+    backdrop-filter: none;
+    background: var(--panel-strong);
+    padding: 8px 12px;
+  }
   .hero-head {
     display: flex;
     align-items: center;
@@ -695,6 +702,9 @@ var server = (https ? function (requestListener) {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .hero.classic-hero h1 {
+    font: 600 1.1rem/1.2 monospace;
   }
   .menu-toggle {
     width: 34px;
@@ -711,12 +721,22 @@ var server = (https ? function (requestListener) {
   .menu-toggle:hover {
     background: var(--accent-soft);
   }
+  .hero.classic-hero .menu-toggle {
+    border-radius: 0;
+    box-shadow: none;
+    background: transparent;
+    font-family: monospace;
+  }
   .toolbar {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 8px 12px;
     align-items: start;
     margin-top: 10px;
+  }
+  .hero.classic-hero .toolbar {
+    margin-top: 8px;
+    gap: 6px 12px;
   }
   .hero.menu-collapsed {
     width: 100%;
@@ -733,6 +753,12 @@ var server = (https ? function (requestListener) {
   }
   .hero.menu-collapsed:hover {
     box-shadow: 0 20px 42px rgba(62, 76, 92, 0.16);
+  }
+  .hero.classic-hero.menu-collapsed {
+    padding: 6px 12px;
+  }
+  .hero.classic-hero.menu-collapsed:hover {
+    box-shadow: none;
   }
   .toolbar-group {
     display: flex;
@@ -755,6 +781,51 @@ var server = (https ? function (requestListener) {
     cursor: pointer;
     min-height: 34px;
     font-size: 0.84rem;
+  }
+  .hero.classic-hero .button,
+  .hero.classic-hero .toolbar label.select,
+  .hero.classic-hero .toggle,
+  .hero.classic-hero select {
+    border-radius: 0;
+    box-shadow: none;
+    background: transparent;
+    font-family: monospace;
+    font-size: 0.82rem;
+  }
+  .hero.classic-hero .button,
+  .hero.classic-hero .toolbar label.select,
+  .hero.classic-hero .toggle {
+    min-height: 30px;
+    padding: 4px 8px;
+  }
+  .hero.classic-hero select {
+    min-height: 30px;
+    padding: 4px 8px;
+  }
+  .hero.classic-hero .button.primary {
+    background: transparent;
+    color: var(--text);
+    border-color: var(--border);
+  }
+  .hero.classic-hero .button:hover,
+  .hero.classic-hero .toolbar label.select:hover,
+  .hero.classic-hero .toggle:hover,
+  .hero.classic-hero .menu-toggle:hover {
+    color: #c0392b;
+    background: transparent;
+  }
+  .hero.classic-hero .compact-select {
+    min-width: 86px;
+  }
+  .hero.classic-hero .grid-size-control {
+    min-width: 118px;
+    padding: 0 8px;
+  }
+  .hero.classic-hero .icon-action,
+  .hero.classic-hero .menu-toggle {
+    width: 30px;
+    min-width: 30px;
+    height: 30px;
   }
   .button.primary {
     background: var(--accent);
@@ -862,6 +933,12 @@ var server = (https ? function (requestListener) {
   .panel {
     overflow: hidden;
   }
+  .panel.classic-panel {
+    border-radius: 0;
+    box-shadow: none;
+    background: var(--panel-strong);
+    backdrop-filter: none;
+  }
   .list-header {
     display: grid;
     grid-template-columns: minmax(240px, 2.4fr) 1.1fr 0.7fr 1fr;
@@ -875,6 +952,16 @@ var server = (https ? function (requestListener) {
     all: unset;
     cursor: pointer;
   }
+  .list-header.classic-header {
+    padding: 10px 12px 4px;
+    color: var(--text);
+    font: 90% monospace;
+  }
+  .list-header.classic-header button:hover,
+  .list-header.classic-header button:focus {
+    color: #c0392b;
+    text-decoration: underline;
+  }
   .entries {
     display: grid;
     gap: 12px;
@@ -886,6 +973,59 @@ var server = (https ? function (requestListener) {
   .entries[data-view="simple"] {
     gap: 0;
     padding: 6px 10px 8px;
+  }
+  .entries[data-view="classic"] {
+    gap: 0;
+    padding: 8px 12px 12px;
+    font-family: monospace;
+  }
+  .entries[data-view="classic"] .entry {
+    display: grid;
+    grid-template-columns: minmax(240px, 2.4fr) 1.1fr 0.7fr 1fr;
+    gap: 12px;
+    align-items: center;
+    padding: 3px 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+  .entries[data-view="classic"] .entry::after {
+    display: none;
+  }
+  .entries[data-view="classic"] .entry-main {
+    min-width: 0;
+  }
+  .entries[data-view="classic"] .entry-main-content {
+    gap: 0;
+  }
+  .entries[data-view="classic"] .entry-thumb,
+  .entries[data-view="classic"] .entry-sub {
+    display: none;
+  }
+  .entries[data-view="classic"] .entry-name,
+  .entries[data-view="classic"] .entry-col {
+    font-family: monospace;
+    font-size: calc(0.9rem * var(--item-scale));
+    line-height: 1.2;
+  }
+  .entries[data-view="classic"] .entry-col {
+    color: var(--text);
+  }
+  .entries[data-view="classic"] .entry-actions {
+    margin-left: 6px;
+    gap: 4px;
+  }
+  .entries[data-view="classic"] .icon-button {
+    width: calc(22px * var(--item-scale));
+    height: calc(22px * var(--item-scale));
+    border-radius: 6px;
+    background: transparent;
+    font-size: calc(0.8rem * var(--item-scale));
+  }
+  .entries[data-view="classic"] .entry-link {
+    inset: -2px -4px;
+    border-radius: 6px;
   }
   .entries[data-view="simple"] .entry {
     display: block;
@@ -1440,14 +1580,19 @@ var server = (https ? function (requestListener) {
       min-width: 40px;
     }
     .list-header { display: none; }
+    .entries[data-view="classic"],
     .entries[data-view="simple"],
     .entries[data-view="list"] {
       grid-template-columns: 1fr;
     }
+    .entries[data-view="classic"] .entry,
     .entries[data-view="simple"] .entry,
     .entries[data-view="list"] .entry {
       grid-template-columns: 1fr;
       gap: 8px;
+    }
+    .entries[data-view="classic"] .entry-col {
+      margin-left: 0;
     }
     .entries[data-view="simple"] {
       padding: 4px 8px 6px;
@@ -1523,6 +1668,9 @@ var server = (https ? function (requestListener) {
       padding: 3px 1px;
       border-radius: 0;
     }
+    .entries[data-view="classic"] .entry {
+      padding: 2px 0;
+    }
     .entry-main-content {
       align-items: flex-start;
     }
@@ -1592,6 +1740,7 @@ var server = (https ? function (requestListener) {
      <label class="select compact-select" title="表示">
       <span class="label-icon">☰</span>
       <select id="viewMode">
+      <option value="classic">従来</option>
       <option value="simple">簡易</option>
        <option value="list">リスト</option>
        <option value="grid">グリッド</option>
@@ -1823,14 +1972,21 @@ var server = (https ? function (requestListener) {
 
  function renderEntries() {
    var container = document.getElementById('entries');
+   var hero = document.querySelector('.hero');
+   var panel = document.querySelector('.panel');
+   var listHeader = document.getElementById('listHeader');
    var view = document.getElementById('viewMode').value;
    var showThumbs = document.getElementById('thumbToggle').checked || view === 'gallery';
    container.style.setProperty('--grid-size', document.getElementById('gridSize').value + 'px');
    var scale = Math.max(0.56, Math.min(1.22, document.getElementById('gridSize').value / 220));
    container.style.setProperty('--grid-scale', scale.toFixed(3));
    container.style.setProperty('--item-scale', scale.toFixed(3));
-   document.getElementById('listHeader').className =
-     (view === 'grid' || view === 'gallery') ? 'list-header hidden-header' : 'list-header';
+   listHeader.className =
+     (view === 'grid' || view === 'gallery')
+       ? 'list-header hidden-header'
+       : ('list-header' + (view === 'classic' ? ' classic-header' : ''));
+   hero.classList.toggle('classic-hero', view === 'classic');
+   panel.classList.toggle('classic-panel', view === 'classic');
    container.dataset.view = view;
    container.innerHTML = '';
    getSortedEntries().forEach(function (entry) {
